@@ -55,6 +55,7 @@ python -m pip install -r requirements-dev.txt
 python test_reelforge.py
 python test_api.py
 python test_generation.py
+python test_kaggle.py
 python check_schema_order.py
 ```
 
@@ -69,6 +70,10 @@ python check_schema_order.py
   makes no billable calls. It proves our request handling, not the model.
 - `test_ltx_integration.py` — real LTX generation. Opt-in and billable; skips
   itself without credentials, and never runs in CI.
+- `test_kaggle.py` — the Kaggle provider, the worker API, job claiming,
+  timeouts, stale-job recovery, upload validation and the scene cache.
+  Fakes the worker, so it needs no Kaggle account, GPU, weights or
+  internet access.
 - `check_schema_order.py` — fails if a table references one declared later.
   SQLite accepts that; PostgreSQL does not.
 
@@ -91,6 +96,10 @@ python check_schema_order.py
 | POST | `/api/projects/{id}/jobs/{jobId}/cancel` | Ask a render to stop |
 | GET | `/api/projects/{id}/generations` | Generation audit trail |
 | POST | `/api/projects/{id}/render` | Enqueue a render job |
+| GET | `/api/worker/kaggle/jobs/next` | Worker: claim a scene job |
+| GET | `/api/worker/kaggle/jobs/{id}/reference` | Worker: fetch a reference image |
+| POST | `/api/worker/kaggle/jobs/{id}/complete` | Worker: upload a generated clip |
+| POST | `/api/worker/kaggle/jobs/{id}/fail` | Worker: report a failure |
 | GET | `/api/projects/{id}/jobs/{jobId}` | Render job state |
 
 Editing a scene or adding an asset resets the project to `draft` and clears the
@@ -108,13 +117,17 @@ backend/app/
   storage.py     Storage protocol, LocalStorage, S3 boundary
   jobs.py        render jobs, decoupled from the request layer
   providers.py   VideoGenerator protocol, mock generator, registry
-  ltx.py         the LTX provider: API client, chunking, ratio mapping
+  ltx.py         the hosted LTX provider: API client, chunking, ratios
+  kaggle.py      the Kaggle provider: scene queue, wait, normalisation
   render.py      assembly: provider clips -> concat -> audio -> reel
   ffmpeg.py      command construction and execution
   storyboard.py  beat sheets and the duration-aware planner
 frontend/
   lib/api.ts     the only place the UI talks to the backend
   app/           landing, create, dashboard, projects/[id]
+kaggle/
+  reelforge_worker.py  the GPU worker that polls this API
+  README.md            Kaggle setup, model choice, limitations
 ```
 
 Layering runs one way: `main` calls `repo` and `jobs`; `jobs` calls `render`;
@@ -130,7 +143,8 @@ Defaults are chosen so the app runs locally with no configuration at all.
 | `REELFORGE_DB_DIALECT` | `sqlite` | `sqlite` or `postgres` |
 | `REELFORGE_DATA_DIR` | `backend/data` | Local database and media root |
 | `REELFORGE_STORAGE` | `local` | `local` or `s3` |
-| `REELFORGE_VIDEO_PROVIDER` | `mock` | `mock` or `ltx` |
+| `REELFORGE_VIDEO_PROVIDER` | `mock` | `mock`, `ltx` or `kaggle` |
+| `REELFORGE_KAGGLE_WORKER_TOKEN` | unset | Enables the Kaggle provider and worker API |
 | `REELFORGE_JOB_RUNNER` | `thread` | `thread` or `external` |
 | `REELFORGE_LTX_ENDPOINT` | unset | Enables the LTX provider |
 | `REELFORGE_FONT` | autodetected | Caption font path |
@@ -261,6 +275,91 @@ python test_ltx_integration.py
 Without both variables that file skips and says so, rather than passing
 silently.
 
+## Kaggle GPU beta worker
+
+Free GPU generation for the beta, using open-source LTX-Video on a Kaggle T4.
+Full setup, model rationale and worker configuration are in
+[kaggle/README.md](kaggle/README.md).
+
+**Kaggle is for development and beta generation, not long-term production GPU
+infrastructure.** Sessions are time-limited and can be killed without warning.
+The provider abstraction is what makes replacing it cheap.
+
+### Architecture
+
+The backend never starts or calls a Kaggle notebook, because a Kaggle session
+has no stable inbound address. Control runs the other way:
+
+```
+FastAPI backend  ──>  scene_jobs table  <──  Kaggle worker polls for work
+      |                                            |
+      |                                      LTX-Video on a T4
+      |               uploads the mp4  <───────────┘
+      v
+ffmpeg normalisation  ->  concat  ->  audio  ->  final reel
+```
+
+1. A render asks the `kaggle` provider for a scene.
+2. The provider inserts a `scene_jobs` row and waits.
+3. A worker claims it over the authenticated worker API, generates, uploads.
+4. The provider normalises the upload and hands it to the existing pipeline.
+
+The queue is a database table rather than an in-memory queue, because the
+worker is a separate process on someone else's hardware and a restart on
+either side must not lose or duplicate work. Claiming is a conditional
+`UPDATE`, so two workers polling at once cannot take the same scene.
+
+### The backend must be reachable from Kaggle
+
+The worker polls **inbound**, so `localhost:8000` is not reachable from a
+Kaggle session. You need a deployed API with a public HTTPS URL, or a secure
+tunnel to your local backend (ngrok, Cloudflare Tunnel, tailscale funnel).
+
+**This repository does not install or configure a tunnel.** Set one up
+yourself and point `REELFORGE_API_BASE` at the HTTPS URL. Exposing the API
+this way exposes the whole API, so use a strong worker token and take the
+tunnel down when you are not testing.
+
+### What is not trusted
+
+The uploaded clip's duration, resolution and frame rate are all treated as
+suggestions and rewritten by the existing ffmpeg normalisation. Uploads are
+size-capped, content-type checked, ffprobed, and refused if shorter than the
+scene: ffmpeg can trim a long clip but cannot extend a short one, and
+accepting one would quietly produce a reel shorter than the storyboard.
+
+### Local configuration
+
+```powershell
+$env:REELFORGE_VIDEO_PROVIDER = "kaggle"
+$env:REELFORGE_KAGGLE_WORKER_TOKEN = "<generate one, keep it secret>"
+cd backend
+python -m uvicorn app.main:app --reload --port 8000
+```
+
+`/health` then reports `kaggle: true` and `worker_api_enabled: true`, and
+never the token itself. Generate a token with:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+### Trying it without a GPU
+
+The worker's `--dry-run` mode replaces the model with a synthetic ffmpeg clip,
+so the whole loop works with no GPU, no weights and no downloads:
+
+```bash
+REELFORGE_API_BASE=http://localhost:8000 REELFORGE_WORKER_TOKEN=dev-token python kaggle/reelforge_worker.py --dry-run --max-jobs 5
+```
+
+### Quality in beta
+
+Standard and High both use the same 2B distilled checkpoint and differ only in
+step count. The UI does not claim otherwise. Set
+`REELFORGE_VIDEO_PROVIDER=ltx` if you want the paid hosted model instead;
+`backend/app/ltx.py` is unchanged and still available.
+
 ## Operational notes
 
 - In-process jobs do not survive a restart, so on boot the app fails any
@@ -276,6 +375,11 @@ silently.
 - If one scene fails, the others still generate and are kept. The reel fails
   with a message naming the scene, and that scene alone can be retried.
 - A render can be cancelled; the worker stops between scenes.
+- Retrying a scene reuses the provider the reel was last rendered with.
+  The provider is part of each scene's cache fingerprint, so falling back
+  to the server default would rebuild the whole reel.
+- Scene jobs survive a restart: anything left claimed by a dead worker is
+  requeued on boot, and fails cleanly once its attempts are used up.
 
 ## Not in V1
 
@@ -283,8 +387,11 @@ silently.
   its request handling is tested against a fake transport, but no LTX
   credentials were available in this environment, so real generation has never
   been run. See `test_ltx_integration.py`.
-- Guaranteed visual consistency between scenes or chunks; the endpoint exposes
-  no seed or reference parameter.
+- Guaranteed visual consistency between scenes or chunks; neither provider
+  exposes a seed or reference parameter for it.
+- A verified Kaggle GPU generation. The queue, worker API, upload,
+  normalisation and retry flow are all tested with a fake worker, but the
+  GPU code path has never run against real model weights.
 - Voice-over and text-to-speech.
 - Auto-generated captions from a script; captions are per-scene and manual.
 - Accounts and multi-user separation; the workspace is whoever has the URL.

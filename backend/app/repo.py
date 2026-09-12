@@ -10,6 +10,7 @@ boundary — an edit that also invalidates a render is one atomic unit.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from . import db
@@ -515,6 +516,172 @@ def latest_job(conn: Any, project_id: str) -> dict | None:
         (project_id,),
     ).fetchone()
     return dict(row) if row else None
+
+
+# --- scene jobs (external GPU worker queue) --------------------------------
+#
+# Statuses: pending -> claimed -> completed | failed | cancelled.
+# `pending` is the only claimable state, and claiming is a conditional UPDATE
+# so two workers polling at the same moment cannot both take one scene.
+
+JOB_PENDING, JOB_CLAIMED = "pending", "claimed"
+JOB_COMPLETED, JOB_FAILED, JOB_CANCELLED = "completed", "failed", "cancelled"
+SCENE_JOB_STATUSES = (
+    JOB_PENDING, JOB_CLAIMED, JOB_COMPLETED, JOB_FAILED, JOB_CANCELLED,
+)
+TERMINAL_SCENE_JOB_STATUSES = (JOB_COMPLETED, JOB_FAILED, JOB_CANCELLED)
+
+
+def create_scene_job(
+    conn: Any, *, project_id: str, scene_id: str, provider: str, prompt: str,
+    duration: int, width: int, height: int, fps: int, quality: str,
+    reference_key: str | None = None,
+) -> str:
+    job_id = new_id("sjob")
+    conn.execute(
+        db.sql(
+            "INSERT INTO scene_jobs (id, project_id, scene_id, provider, status,"
+            " prompt, duration, width, height, fps, quality, reference_key,"
+            " created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,{now})"
+        ),
+        (job_id, project_id, scene_id, provider, JOB_PENDING, prompt, duration,
+         width, height, fps, quality, reference_key),
+    )
+    return job_id
+
+
+def get_scene_job(conn: Any, job_id: str) -> dict | None:
+    row = conn.execute(
+        db.sql("SELECT * FROM scene_jobs WHERE id = ?"), (job_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def claim_next_scene_job(
+    conn: Any, *, provider: str, worker_id: str, candidates: int = 20
+) -> dict | None:
+    """Atomically take the oldest pending job, or return None.
+
+    The conditional UPDATE is the lock: it only matches while the row is still
+    `pending`, so of two workers racing for the same row exactly one gets a
+    rowcount of 1 and the loser moves to the next candidate. This works the
+    same on SQLite and PostgreSQL without SELECT ... FOR UPDATE.
+    """
+    rows = conn.execute(
+        db.sql(
+            "SELECT id FROM scene_jobs WHERE status = ? AND provider = ?"
+            " ORDER BY created_at, id LIMIT ?"
+        ),
+        (JOB_PENDING, provider, candidates),
+    ).fetchall()
+    for row in rows:
+        changed = conn.execute(
+            db.sql(
+                "UPDATE scene_jobs SET status = ?, claimed_by = ?,"
+                " claimed_at = {now}, attempts = attempts + 1"
+                " WHERE id = ? AND status = ?"
+            ),
+            (JOB_CLAIMED, worker_id, row["id"], JOB_PENDING),
+        ).rowcount
+        if changed:
+            return get_scene_job(conn, row["id"])
+    return None
+
+
+def complete_scene_job(conn: Any, job_id: str, output_key: str) -> bool:
+    """Mark a claimed job done. False if it was not claimed any more."""
+    changed = conn.execute(
+        db.sql(
+            "UPDATE scene_jobs SET status = ?, output_key = ?, error = NULL,"
+            " completed_at = {now} WHERE id = ? AND status = ?"
+        ),
+        (JOB_COMPLETED, output_key, job_id, JOB_CLAIMED),
+    ).rowcount
+    return bool(changed)
+
+
+def fail_scene_job(conn: Any, job_id: str, message: str) -> bool:
+    """Fail a job that is not already finished."""
+    placeholders = ",".join("?" for _ in TERMINAL_SCENE_JOB_STATUSES)
+    changed = conn.execute(
+        db.sql(
+            f"UPDATE scene_jobs SET status = ?, error = ?, completed_at = {{now}}"
+            f" WHERE id = ? AND status NOT IN ({placeholders})"
+        ),
+        (JOB_FAILED, message[:500], job_id, *TERMINAL_SCENE_JOB_STATUSES),
+    ).rowcount
+    return bool(changed)
+
+
+def cancel_scene_jobs_for_scene(conn: Any, scene_id: str) -> int:
+    placeholders = ",".join("?" for _ in TERMINAL_SCENE_JOB_STATUSES)
+    return int(conn.execute(
+        db.sql(
+            f"UPDATE scene_jobs SET status = ?, completed_at = {{now}}"
+            f" WHERE scene_id = ? AND status NOT IN ({placeholders})"
+        ),
+        (JOB_CANCELLED, scene_id, *TERMINAL_SCENE_JOB_STATUSES),
+    ).rowcount)
+
+
+def requeue_stale_scene_jobs(conn: Any, *, claim_timeout_seconds: int,
+                             max_attempts: int) -> dict[str, int]:
+    """Rescue jobs whose worker disappeared.
+
+    A Kaggle session can be killed at any moment, leaving a job stuck at
+    `claimed` with nobody working on it. Anything claimed longer ago than the
+    timeout goes back to `pending` so another worker can take it, unless it
+    has already used up its attempts, in which case it fails cleanly rather
+    than looping on free hardware forever.
+    """
+    # The cutoff is computed here rather than in SQL: date arithmetic is one
+    # of the few things with no portable spelling, and timestamps are stored
+    # in a lexicographically sortable UTC format, so a plain string compare
+    # works identically on SQLite and PostgreSQL.
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(seconds=int(claim_timeout_seconds))
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    stale = rows_to_dicts(conn.execute(
+        db.sql(
+            "SELECT id, attempts FROM scene_jobs WHERE status = ?"
+            " AND claimed_at IS NOT NULL AND claimed_at < ?"
+        ),
+        (JOB_CLAIMED, cutoff),
+    ))
+    requeued = failed = 0
+    for job in stale:
+        if job["attempts"] >= max_attempts:
+            conn.execute(
+                db.sql(
+                    "UPDATE scene_jobs SET status = ?, error = ?,"
+                    " completed_at = {now} WHERE id = ? AND status = ?"
+                ),
+                (JOB_FAILED,
+                 "generation was attempted several times without finishing",
+                 job["id"], JOB_CLAIMED),
+            )
+            failed += 1
+        else:
+            conn.execute(
+                db.sql(
+                    "UPDATE scene_jobs SET status = ?, claimed_by = NULL,"
+                    " claimed_at = NULL WHERE id = ? AND status = ?"
+                ),
+                (JOB_PENDING, job["id"], JOB_CLAIMED),
+            )
+            requeued += 1
+    return {"requeued": requeued, "failed": failed}
+
+
+def count_scene_jobs_by_status(conn: Any, provider: str = "kaggle") -> dict[str, int]:
+    rows = conn.execute(
+        db.sql(
+            "SELECT status, COUNT(*) AS n FROM scene_jobs WHERE provider = ?"
+            " GROUP BY status"
+        ),
+        (provider,),
+    ).fetchall()
+    return {r["status"]: int(r["n"]) for r in rows}
 
 
 def claim_queued_jobs(conn: Any, limit: int = 10) -> list[dict]:

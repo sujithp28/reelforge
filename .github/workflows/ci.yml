@@ -48,6 +48,11 @@ jobs:
       - name: Generation provider tests
         run: python test_generation.py
 
+      # Kaggle provider, worker API, job claiming, timeouts and recovery.
+      # Fakes the worker: no Kaggle account, no GPU, no weights, no network.
+      - name: Kaggle worker API tests
+        run: python test_kaggle.py
+
       # Must skip cleanly rather than fail when no credentials are present.
       - name: Real LTX tests skip without credentials
         run: python test_ltx_integration.py

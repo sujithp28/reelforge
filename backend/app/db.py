@@ -111,7 +111,38 @@ SCHEMA = [
         created_at  TEXT NOT NULL
     )
     """,
+    """
+    -- Durable per-scene generation queue, drained by an external GPU worker.
+    -- Deliberately a table rather than an in-memory queue: the worker is a
+    -- separate process on someone else's hardware, and a restart on either
+    -- side must not lose or duplicate work.
+    CREATE TABLE IF NOT EXISTS scene_jobs (
+        id            TEXT PRIMARY KEY,
+        project_id    TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        scene_id      TEXT NOT NULL REFERENCES scenes(id) ON DELETE CASCADE,
+        provider      TEXT NOT NULL DEFAULT 'kaggle',
+        status        TEXT NOT NULL DEFAULT 'pending',
+        prompt        TEXT NOT NULL,
+        duration      INTEGER NOT NULL,
+        width         INTEGER NOT NULL,
+        height        INTEGER NOT NULL,
+        fps           INTEGER NOT NULL,
+        quality       TEXT NOT NULL DEFAULT 'standard',
+        -- Storage key, never a filesystem path. Served to the worker through
+        -- an authenticated endpoint rather than as a URL it could tamper with.
+        reference_key TEXT,
+        output_key    TEXT,
+        attempts      INTEGER NOT NULL DEFAULT 0,
+        claimed_by    TEXT,
+        error         TEXT,
+        created_at    TEXT NOT NULL,
+        claimed_at    TEXT,
+        completed_at  TEXT
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_scenes_project ON scenes(project_id, position)",
+    "CREATE INDEX IF NOT EXISTS idx_scene_jobs_status ON scene_jobs(status, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_scene_jobs_scene ON scene_jobs(scene_id)",
     "CREATE INDEX IF NOT EXISTS idx_assets_project ON assets(project_id)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_project ON render_jobs(project_id)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_status ON render_jobs(status)",

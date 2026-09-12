@@ -5,15 +5,19 @@ No SQL, no ffmpeg, no filesystem paths live here.
 """
 from __future__ import annotations
 
+import hmac
 import logging
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import config, db, ffmpeg, jobs, providers, repo, storage, storyboard
+from . import (
+    config, db, ffmpeg, jobs, kaggle, providers, repo, storage, storyboard,
+)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("reelforge")
@@ -33,8 +37,17 @@ app.add_middleware(
 db.init()
 with db.connect() as _conn:
     _released = repo.release_stale_renders(_conn)
+    # Scene jobs outlive the API process, so a restart must requeue anything a
+    # dead worker left claimed rather than leaving it stuck.
+    _recovered = repo.requeue_stale_scene_jobs(
+        _conn,
+        claim_timeout_seconds=config.KAGGLE_CLAIM_TIMEOUT_SECONDS,
+        max_attempts=config.KAGGLE_MAX_ATTEMPTS,
+    )
 if _released:
     log.warning("released %d render(s) orphaned by a restart", _released)
+if _recovered["requeued"] or _recovered["failed"]:
+    log.warning("recovered stale scene jobs: %s", _recovered)
 
 # Local storage is served by the app. With REELFORGE_STORAGE=s3 the keys are
 # identical and url_for returns absolute URLs instead, so this mount becomes
@@ -182,6 +195,11 @@ def _summarize(project: dict) -> dict:
 
 @app.get("/health")
 def health():
+    try:
+        with db.connect() as conn:
+            queue_depth = repo.count_scene_jobs_by_status(conn)
+    except Exception:  # health must answer even if the queue cannot be read
+        queue_depth = {}
     return {
         "status": "ok",
         "service": "reelforge-api",
@@ -192,6 +210,9 @@ def health():
         "job_runner": config.JOB_RUNNER,
         "video_provider": config.VIDEO_PROVIDER,
         "providers": providers.available_providers(),
+        # Whether the worker API is switched on, never the token itself.
+        "worker_api_enabled": bool(config.KAGGLE_WORKER_TOKEN),
+        "scene_job_queue": queue_depth,
     }
 
 
@@ -467,8 +488,13 @@ def retry_scene(project_id: str, scene_id: str):
         _require_project(conn, project_id)
         if repo.get_scene(conn, project_id, scene_id) is None:
             raise HTTPException(404, "scene not found")
+        previous = repo.latest_job(conn, project_id)
 
-    name = config.VIDEO_PROVIDER
+    # Reuse the provider this reel was last rendered with. The provider is
+    # part of each scene's cache fingerprint, so silently falling back to the
+    # server default would invalidate every cached clip and regenerate the
+    # whole reel instead of the one scene the customer asked to retry.
+    name = (previous or {}).get("provider") or config.VIDEO_PROVIDER
     generator = _require_available_provider(name)
 
     with db.connect() as conn:
@@ -510,6 +536,232 @@ def list_generations(
     with db.connect() as conn:
         _require_project(conn, project_id)
         return {"generations": repo.list_generations(conn, project_id, limit)}
+
+
+# --- Kaggle worker API ------------------------------------------------------
+#
+# These routes are for the external GPU worker only, not the frontend. They
+# are gated on a shared secret and are the only way the worker can see a job
+# or reach a reference image — it never receives a filesystem path.
+
+def _require_worker(authorization: str | None) -> None:
+    """Authenticate the GPU worker on a bearer token.
+
+    Compared with hmac.compare_digest so a wrong token cannot be recovered by
+    timing the response. Returns 503 rather than 401 when no token is
+    configured at all, because that is a server misconfiguration and not the
+    caller's fault.
+    """
+    expected = config.KAGGLE_WORKER_TOKEN
+    if not expected:
+        raise HTTPException(503, "the worker API is not enabled on this server")
+    scheme, _, presented = (authorization or "").partition(" ")
+    if scheme.lower() != "bearer" or not presented:
+        raise HTTPException(
+            401, "expected an Authorization: Bearer <token> header",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not hmac.compare_digest(presented.strip(), expected):
+        # Never echo either token, not even a prefix.
+        log.warning("worker authentication failed")
+        raise HTTPException(401, "invalid worker token")
+
+
+def _worker_job_view(job: dict) -> dict:
+    """Exactly what the worker needs, and nothing else.
+
+    No storage keys, no filesystem paths, no project internals. The reference
+    image is offered as an endpoint to call, not a location to read.
+    """
+    return {
+        "job_id": job["id"],
+        "scene_id": job["scene_id"],
+        "prompt": job["prompt"],
+        "seconds": job["duration"],
+        "width": job["width"],
+        "height": job["height"],
+        "fps": job["fps"],
+        "quality": job["quality"],
+        "attempt": job["attempts"],
+        "reference_url": (
+            f"/api/worker/kaggle/jobs/{job['id']}/reference"
+            if job.get("reference_key") else None
+        ),
+    }
+
+
+@app.get("/api/worker/kaggle/jobs/next")
+def worker_next_job(
+    authorization: str | None = Header(default=None),
+    worker_id: str = Query(default="kaggle", max_length=64),
+):
+    """Claim the oldest pending scene job, or report that there is none.
+
+    Claiming is atomic in the repository layer, so two workers polling
+    simultaneously cannot be handed the same scene.
+    """
+    _require_worker(authorization)
+    with db.connect() as conn:
+        # Rescue anything a dead worker left claimed before handing out work.
+        recovered = repo.requeue_stale_scene_jobs(
+            conn,
+            claim_timeout_seconds=config.KAGGLE_CLAIM_TIMEOUT_SECONDS,
+            max_attempts=config.KAGGLE_MAX_ATTEMPTS,
+        )
+        if recovered["requeued"] or recovered["failed"]:
+            log.info("stale scene jobs: %s", recovered)
+        job = repo.claim_next_scene_job(
+            conn, provider="kaggle", worker_id=worker_id[:64]
+        )
+    if job is None:
+        return {"job": None}
+    log.info("worker %s claimed scene job %s", worker_id, job["id"])
+    return {"job": _worker_job_view(job)}
+
+
+@app.get("/api/worker/kaggle/jobs/{job_id}/reference")
+def worker_job_reference(
+    job_id: str,
+    authorization: str | None = Header(default=None),
+):
+    """Stream one job's reference image.
+
+    Addressed by job id, and the storage key comes from that row rather than
+    from the caller, so there is no path for a worker to request an arbitrary
+    file. `localize` additionally refuses any key that escapes the root.
+    """
+    _require_worker(authorization)
+    with db.connect() as conn:
+        job = repo.get_scene_job(conn, job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    if not job.get("reference_key"):
+        raise HTTPException(404, "this job has no reference image")
+    path = storage.storage.localize(job["reference_key"])
+    if path is None:
+        raise HTTPException(404, "the reference image is no longer available")
+    return FileResponse(path)
+
+
+@app.post("/api/worker/kaggle/jobs/{job_id}/complete")
+async def worker_complete_job(
+    job_id: str,
+    authorization: str | None = Header(default=None),
+    file: UploadFile = File(...),
+):
+    """Accept a generated clip for a claimed job.
+
+    The upload is validated before it is accepted: size, declared type, and
+    an ffprobe check that it really is decodable video. A worker cannot choose
+    where the file lands — the key is derived from the job id.
+    """
+    _require_worker(authorization)
+    with db.connect() as conn:
+        job = repo.get_scene_job(conn, job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    if job["status"] != repo.JOB_CLAIMED:
+        raise HTTPException(
+            409, f"this job is {job['status']} and is not awaiting an upload"
+        )
+
+    declared = (file.content_type or "").lower()
+    if declared and not (declared.startswith("video/")
+                         or declared == "application/octet-stream"):
+        raise HTTPException(415, f"unsupported content type '{declared}'")
+
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(1024 * 512)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > config.KAGGLE_MAX_CLIP_BYTES:
+            raise HTTPException(
+                413,
+                f"clip exceeds {config.KAGGLE_MAX_CLIP_BYTES // (1024 * 1024)}MB",
+            )
+        chunks.append(chunk)
+    if not chunks:
+        raise HTTPException(422, "the uploaded clip was empty")
+
+    key = storage.kaggle_staging_key(job_id)
+    storage.storage.save_bytes(key, b"".join(chunks))
+
+    # Trust nothing: confirm ffmpeg can actually read it before we accept it.
+    staged = storage.storage.localize(key)
+    probed = ffmpeg.probe_duration(str(staged)) if staged else None
+    if staged is None or probed is None:
+        storage.storage.delete_prefix(key)
+        raise HTTPException(422, "the uploaded file is not readable video")
+
+    # A clip shorter than the scene cannot be trimmed up to length. Accepting
+    # one would silently produce a scene shorter than the storyboard says,
+    # which is the exact corruption normalisation exists to prevent, so it is
+    # refused here and the job goes back for another attempt.
+    if probed + kaggle.DURATION_TOLERANCE_SECONDS < job["duration"]:
+        storage.storage.delete_prefix(key)
+        log.warning(
+            "scene job %s upload is %.2fs but the scene needs %ss",
+            job_id, probed, job["duration"],
+        )
+        raise HTTPException(
+            422,
+            f"the clip is {probed:.1f}s but this scene needs"
+            f" {job['duration']}s; generate at least the requested length",
+        )
+
+    with db.connect() as conn:
+        if not repo.complete_scene_job(conn, job_id, key):
+            raise HTTPException(409, "this job is no longer awaiting an upload")
+    log.info("scene job %s completed by worker (%d bytes)", job_id, total)
+    return {"job_id": job_id, "status": repo.JOB_COMPLETED}
+
+
+class WorkerFailureRequest(BaseModel):
+    # Free-text, worker-supplied, and therefore never shown to a customer.
+    detail: str | None = Field(default=None, max_length=2000)
+    retryable: bool = True
+
+
+@app.post("/api/worker/kaggle/jobs/{job_id}/fail")
+def worker_fail_job(
+    job_id: str,
+    request: WorkerFailureRequest,
+    authorization: str | None = Header(default=None),
+):
+    """Report that generation failed.
+
+    The worker's detail is logged for an operator but deliberately not stored
+    as the customer-facing reason: it can contain model names, CUDA errors and
+    stack traces. A retryable failure goes back into the queue so another
+    worker, or the same one after a restart, can pick it up.
+    """
+    _require_worker(authorization)
+    with db.connect() as conn:
+        job = repo.get_scene_job(conn, job_id)
+        if job is None:
+            raise HTTPException(404, "job not found")
+        if job["status"] in repo.TERMINAL_SCENE_JOB_STATUSES:
+            raise HTTPException(409, f"this job is already {job['status']}")
+
+        log.warning(
+            "worker reported failure for scene job %s (attempt %d): %s",
+            job_id, job["attempts"],
+            kaggle.redact_token((request.detail or "no detail")[:500]),
+        )
+        if request.retryable and job["attempts"] < config.KAGGLE_MAX_ATTEMPTS:
+            conn.execute(
+                db.sql(
+                    "UPDATE scene_jobs SET status = ?, claimed_by = NULL,"
+                    " claimed_at = NULL WHERE id = ?"
+                ),
+                (repo.JOB_PENDING, job_id),
+            )
+            return {"job_id": job_id, "status": repo.JOB_PENDING}
+        repo.fail_scene_job(conn, job_id, kaggle.FAILED_MESSAGE)
+    return {"job_id": job_id, "status": repo.JOB_FAILED}
 
 
 @app.get("/api/projects/{project_id}/jobs/{job_id}")

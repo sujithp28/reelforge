@@ -57,6 +57,30 @@ LTX_MAX_POLLS = int(os.environ.get("REELFORGE_LTX_MAX_POLLS", "150"))
 LTX_MAX_CHUNKS_PER_SCENE = int(os.environ.get("REELFORGE_LTX_MAX_CHUNKS", "6"))
 LTX_MAX_ATTEMPTS_PER_CHUNK = int(os.environ.get("REELFORGE_LTX_MAX_ATTEMPTS", "2"))
 
+# --- Kaggle GPU beta worker -------------------------------------------------
+# The backend never starts a Kaggle notebook. It queues scene jobs; a worker
+# running on Kaggle polls for them, generates with open-source LTX-Video, and
+# uploads the result back. See kaggle/README.md.
+#
+# Shared secret for the worker-only endpoints. Unset means the Kaggle
+# provider reports itself unavailable. Never logged in full, never returned
+# by /health.
+KAGGLE_WORKER_TOKEN = os.environ.get("REELFORGE_KAGGLE_WORKER_TOKEN", "")
+# How long a scene job may sit unfinished before it is failed. Kaggle sessions
+# die without warning, so this is what stops a job wedging a render forever.
+KAGGLE_JOB_TIMEOUT_SECONDS = int(os.environ.get("REELFORGE_KAGGLE_JOB_TIMEOUT", "1800"))
+# How often the provider checks its queued job.
+KAGGLE_POLL_SECONDS = float(os.environ.get("REELFORGE_KAGGLE_POLL_SECONDS", "3"))
+# A claimed job whose worker went quiet for this long is returned to the
+# queue for another worker.
+KAGGLE_CLAIM_TIMEOUT_SECONDS = int(os.environ.get("REELFORGE_KAGGLE_CLAIM_TIMEOUT", "600"))
+# Bounded so one bad worker cannot retry a scene forever on free hardware.
+KAGGLE_MAX_ATTEMPTS = int(os.environ.get("REELFORGE_KAGGLE_MAX_ATTEMPTS", "3"))
+# Upload ceiling for a single generated scene clip.
+KAGGLE_MAX_CLIP_BYTES = int(
+    os.environ.get("REELFORGE_KAGGLE_MAX_CLIP_BYTES", 200 * 1024 * 1024)
+)
+
 QUALITIES = ("standard", "high")
 DEFAULT_QUALITY = os.environ.get("REELFORGE_DEFAULT_QUALITY", "standard").lower()
 

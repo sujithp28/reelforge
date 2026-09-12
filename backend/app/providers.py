@@ -9,6 +9,10 @@ not care which provider produced the clips — that is the point of the seam.
         network, no credentials. Remains the default.
   ltx   real AI generation through the LTX hosted API. Implemented in ltx.py;
         reports itself unavailable until an endpoint and key are configured.
+        Paid, and kept available as an option.
+  kaggle real AI generation on a free Kaggle GPU. Implemented in kaggle.py:
+        the backend queues scene jobs and an external worker drains them.
+        The intended provider for the beta.
 
 Providers must honour the requested duration and resolution exactly. render.py
 stream-copies clips during concatenation, so a clip that disagrees about
@@ -80,9 +84,9 @@ class MockGenerator:
         run(cmd)
 
 
-# The real LTX provider lives in ltx.py. It is imported lazily inside
-# build_generator() because ltx.py imports SceneSpec from this module, and a
-# module-level import here would be circular.
+# The real providers live in ltx.py and kaggle.py. They are imported lazily
+# inside build_generator() because both import SceneSpec from this module, and
+# a module-level import here would be circular.
 
 
 def build_generator(name: str | None = None) -> VideoGenerator:
@@ -97,12 +101,21 @@ def build_generator(name: str | None = None) -> VideoGenerator:
             api_key=config.LTX_API_KEY,
             timeout=config.LTX_TIMEOUT_SECONDS,
         )
+    if chosen == "kaggle":
+        from .kaggle import KaggleGenerator
+
+        return KaggleGenerator(
+            worker_token=config.KAGGLE_WORKER_TOKEN,
+            job_timeout=config.KAGGLE_JOB_TIMEOUT_SECONDS,
+            poll_seconds=config.KAGGLE_POLL_SECONDS,
+        )
     raise RenderError(
-        f"unknown video provider {chosen!r}; expected one of: mock, ltx"
+        f"unknown video provider {chosen!r};"
+        f" expected one of: {', '.join(PROVIDER_NAMES)}"
     )
 
 
-PROVIDER_NAMES = ("mock", "ltx")
+PROVIDER_NAMES = ("mock", "ltx", "kaggle")
 
 
 def available_providers() -> dict[str, bool]:

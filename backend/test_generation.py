@@ -167,7 +167,7 @@ def test_provider_selection():
     # The default comes from configuration, and must stay mock for local dev.
     assert providers.build_generator().name == config.VIDEO_PROVIDER
     assert config.VIDEO_PROVIDER == "mock", "mock must remain the default"
-    assert set(providers.PROVIDER_NAMES) == {"mock", "ltx"}
+    assert set(providers.PROVIDER_NAMES) == {"mock", "ltx", "kaggle"}
 
 
 # --- 5. invalid provider ----------------------------------------------------

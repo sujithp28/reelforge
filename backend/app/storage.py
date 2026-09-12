@@ -35,6 +35,11 @@ def clip_key(project_id: str, scene_id: str, fingerprint: str) -> str:
     return f"clips/{project_id}/{scene_id}_{fingerprint}.mp4"
 
 
+def kaggle_staging_key(job_id: str) -> str:
+    """Where an external worker's raw upload is staged before normalisation."""
+    return f"kaggle/{job_id}.mp4"
+
+
 class Storage(Protocol):
     """Minimal surface the app needs. Implement all five for a new backend."""
 
