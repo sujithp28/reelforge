@@ -1,4 +1,4 @@
-"""ReelForge GPU worker for Kaggle.
+﻿"""ReelForge GPU worker for Kaggle.
 
 Runs on a Kaggle T4 session, polls ReelForge for scene jobs, generates each
 one with open-source LTX-Video, and uploads the result back.
@@ -57,9 +57,11 @@ WORKER_ID = os.environ.get("REELFORGE_WORKER_ID", "kaggle-1")
 # Model selection is configuration. The 2B distilled checkpoint is the
 # default because it fits a T4 with room to spare.
 LTX_REPO_DIR = os.environ.get("REELFORGE_LTX_REPO_DIR", "/kaggle/working/LTX-Video")
-LTX_PIPELINE_CONFIG = os.environ.get(
-    "REELFORGE_LTX_PIPELINE_CONFIG", "configs/ltxv-2b-0.9.8-distilled.yaml"
+_DEFAULT_CONFIG = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "configs", "reelforge-t4-distilled.yaml",
 )
+LTX_PIPELINE_CONFIG = os.environ.get("REELFORGE_LTX_PIPELINE_CONFIG", _DEFAULT_CONFIG)
 CUDA_DEVICE = os.environ.get("REELFORGE_CUDA_DEVICE", "0")
 
 # Generation geometry. Deliberately below the customer's final frame: the
@@ -185,6 +187,7 @@ class LTXRunner:
             "--seed", str(random.randint(1, 2**31 - 1)),
             "--pipeline_config", self.pipeline_config,
             "--output_path", str(work),
+            "--offload_to_cpu", "True",
         ]
         if request.reference_image and request.reference_image.exists():
             # Image-to-video: the still conditions the opening frame.
@@ -422,3 +425,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
