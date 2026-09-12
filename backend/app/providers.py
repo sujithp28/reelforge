@@ -5,13 +5,16 @@ A provider turns one scene into one video clip on disk. Everything downstream
 not care which provider produced the clips — that is the point of the seam.
 
   mock  the working local renderer: a Ken Burns move over an uploaded still,
-        or a typographic colour card when a scene has no still. No GPU.
-  ltx   integration boundary for LTX-Video. Declared and selectable, but
-        refuses to run until an endpoint is configured.
+        or a typographic colour card when a scene has no still. No GPU, no
+        network, no credentials. Remains the default.
+  ltx   real AI generation through the LTX hosted API. Implemented in ltx.py;
+        reports itself unavailable until an endpoint and key are configured.
 
 Providers must honour the requested duration and resolution exactly. render.py
 stream-copies clips during concatenation, so a clip that disagrees about
-resolution or frame rate corrupts the join instead of failing loudly.
+resolution or frame rate corrupts the join instead of failing loudly. A
+provider whose model cannot hit those numbers is responsible for closing the
+gap itself, rather than relaxing the contract.
 """
 from __future__ import annotations
 
@@ -36,6 +39,10 @@ class SceneSpec:
     height: int
     fps: int = FPS
     image_path: Path | None = None
+    # Customer-facing quality only: "standard" or "high". Providers map this
+    # to their own settings; no model-specific parameter reaches this struct.
+    quality: str = "standard"
+
 
 
 class VideoGenerator(Protocol):
@@ -73,34 +80,9 @@ class MockGenerator:
         run(cmd)
 
 
-class LTXGenerator:
-    """LTX-Video provider — integration boundary, no GPU required yet.
-
-    Wiring this up means implementing `generate` to submit
-    `spec.prompt` plus the optional `spec.image_path` to the LTX endpoint,
-    poll until the clip is done, and write it to `out` at spec.seconds and
-    spec resolution. Nothing else in the app changes.
-
-    Until REELFORGE_LTX_ENDPOINT is set, `available()` is False and selecting
-    this provider is rejected at the API boundary rather than failing halfway
-    through a render.
-    """
-
-    name = "ltx"
-
-    def __init__(self, endpoint: str = "", api_key: str = "", timeout: int = 600):
-        self.endpoint = endpoint
-        self.api_key = api_key
-        self.timeout = timeout
-
-    def available(self) -> bool:
-        return bool(self.endpoint)
-
-    def generate(self, spec: SceneSpec, out: Path) -> None:
-        raise RenderError(
-            "the LTX provider is an integration boundary and is not implemented"
-            " yet. Set REELFORGE_VIDEO_PROVIDER=mock to render locally."
-        )
+# The real LTX provider lives in ltx.py. It is imported lazily inside
+# build_generator() because ltx.py imports SceneSpec from this module, and a
+# module-level import here would be circular.
 
 
 def build_generator(name: str | None = None) -> VideoGenerator:
@@ -108,6 +90,8 @@ def build_generator(name: str | None = None) -> VideoGenerator:
     if chosen == "mock":
         return MockGenerator()
     if chosen == "ltx":
+        from .ltx import LTXGenerator
+
         return LTXGenerator(
             endpoint=config.LTX_ENDPOINT,
             api_key=config.LTX_API_KEY,
@@ -118,12 +102,27 @@ def build_generator(name: str | None = None) -> VideoGenerator:
     )
 
 
+PROVIDER_NAMES = ("mock", "ltx")
+
+
 def available_providers() -> dict[str, bool]:
     """Provider name to whether it can run, for /health and the API."""
     out = {}
-    for name in ("mock", "ltx"):
+    for name in PROVIDER_NAMES:
         try:
             out[name] = build_generator(name).available()
         except RenderError:
             out[name] = False
     return out
+
+
+def configuration_error(name: str) -> str | None:
+    """Operator-facing reason a provider cannot run, or None if it can."""
+    try:
+        generator = build_generator(name)
+    except RenderError as exc:
+        return str(exc)
+    if generator.available():
+        return None
+    reporter = getattr(generator, "configuration_error", None)
+    return reporter() if reporter else f"{name} is not configured"

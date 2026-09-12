@@ -5,6 +5,8 @@ __pycache__/
 *.pyc
 .env
 .env.local
+# but the documented placeholders are tracked
+!.env.example
 
 # Local SQLite database, uploads and rendered reels
 backend/data/

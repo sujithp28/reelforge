@@ -13,6 +13,17 @@ export const RATIOS = ["9:16", "16:9", "1:1", "4:5"] as const;
 export const INPUT_TYPES = ["Idea", "Image", "Image + text", "Product", "Person"] as const;
 export const DURATIONS = [15, 30, 45, 60] as const;
 
+/** Customer-facing quality. Maps to provider/model settings on the backend. */
+export const QUALITIES = [
+  { value: "standard", label: "Standard", hint: "Faster to generate" },
+  { value: "high", label: "High", hint: "Higher fidelity, slower" },
+] as const;
+
+export type Quality = (typeof QUALITIES)[number]["value"];
+
+/** Per-scene generation state. `failed` is the one the customer can retry. */
+export type ClipStatus = "pending" | "ready" | "failed";
+
 export type Ratio = (typeof RATIOS)[number];
 export type ProjectStatus = "draft" | "rendering" | "ready" | "failed";
 
@@ -27,6 +38,11 @@ export type Scene = {
   asset_url: string | null;
   /** How many times this scene's prompt has been regenerated. */
   regen_count: number;
+  /** Whether this scene's video has been generated yet. */
+  clip_status: ClipStatus;
+  /** Customer-safe reason this scene failed, if it did. */
+  clip_error: string | null;
+  clip_attempts: number;
 };
 
 export type Asset = { id: string; kind: "image" | "audio"; filename: string; url: string };
@@ -46,11 +62,16 @@ export type Project = {
   total_duration: number;
   music_volume: number;
   music_fade_out: number;
+  quality: Quality;
   created_at: string;
   updated_at: string;
   scenes: Scene[];
   assets: Asset[];
-  job: { id: string; status: string; provider: string } | null;
+  job: {
+    id: string;
+    status: string;
+    provider: string;
+  } | null;
 };
 
 export type ProjectSummary = Omit<
@@ -125,6 +146,7 @@ export const api = {
     input_type: string;
     duration: number;
     aspect_ratio: string;
+    quality: string;
   }) => request<Project>("/api/projects", { method: "POST", body: JSON.stringify(body) }),
 
   deleteProject: (id: string) => request<void>(`/api/projects/${id}`, { method: "DELETE" }),
@@ -153,6 +175,28 @@ export const api = {
       body: form,
     });
   },
+
+  updateQuality: (projectId: string, quality: Quality) =>
+    request<Project>(`/api/projects/${projectId}/quality`, {
+      method: "PATCH",
+      body: JSON.stringify({ quality }),
+    }),
+
+  /**
+   * Regenerate one scene and reassemble. Scenes that already succeeded keep
+   * their clips, so this costs one scene rather than the whole reel.
+   */
+  retryScene: (projectId: string, sceneId: string) =>
+    request<{ job_id: string; scene_id: string; status: string }>(
+      `/api/projects/${projectId}/scenes/${sceneId}/retry`,
+      { method: "POST" },
+    ),
+
+  cancelJob: (projectId: string, jobId: string) =>
+    request<{ job_id: string; cancel_requested: boolean }>(
+      `/api/projects/${projectId}/jobs/${jobId}/cancel`,
+      { method: "POST" },
+    ),
 
   updateAudio: (
     projectId: string,

@@ -4,7 +4,10 @@ import { Suspense, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { ArrowLeft, ArrowRight, ImagePlus, Loader2, Sparkles, Upload, X } from "lucide-react";
-import { api, CATEGORIES, DURATIONS, INPUT_TYPES, RATIOS, type Ratio } from "../../lib/api";
+import {
+  api, CATEGORIES, DURATIONS, INPUT_TYPES, QUALITIES, RATIOS,
+  type Quality, type Ratio,
+} from "../../lib/api";
 
 function CreateForm() {
   const router = useRouter();
@@ -21,6 +24,7 @@ function CreateForm() {
   const [input, setInput] = useState<string>("Idea");
   const [ratio, setRatio] = useState<Ratio>("9:16");
   const [duration, setDuration] = useState(30);
+  const [quality, setQuality] = useState<Quality>("standard");
   const [file, setFile] = useState<File | null>(null);
   const [step, setStep] = useState(1);
   const [busy, setBusy] = useState(false);
@@ -38,6 +42,7 @@ function CreateForm() {
         input_type: input,
         duration,
         aspect_ratio: ratio,
+        quality,
       });
       // Uploads need a project to attach to, so the staged file goes up second.
       if (file) {
@@ -100,6 +105,23 @@ function CreateForm() {
             </section>
           </div>
 
+          <section className="mt-6 rounded-2xl border border-zinc-800 bg-zinc-900 p-6">
+            <h2 className="font-semibold">Quality</h2>
+            <p className="mt-1 text-sm text-zinc-500">Applies when scenes are generated.</p>
+            <div className="mt-4 grid gap-2 sm:grid-cols-2">
+              {QUALITIES.map(q => (
+                <button
+                  key={q.value}
+                  onClick={() => setQuality(q.value)}
+                  className={`rounded-xl border p-4 text-left ${quality === q.value ? "border-violet-500 bg-violet-500/10 text-white" : "border-zinc-800 text-zinc-400 hover:border-zinc-700"}`}
+                >
+                  <div className="font-medium">{q.label}</div>
+                  <div className="mt-1 text-xs text-zinc-500">{q.hint}</div>
+                </button>
+              ))}
+            </div>
+          </section>
+
           {error && (
             <p className="mt-6 rounded-xl border border-red-900 bg-red-950/50 p-4 text-sm text-red-300">{error}</p>
           )}
@@ -159,6 +181,7 @@ function CreateForm() {
               <div className="flex justify-between"><span className="text-zinc-500">Source</span><span>{input}</span></div>
               <div className="flex justify-between"><span className="text-zinc-500">Duration</span><span>{duration} sec</span></div>
               <div className="flex justify-between"><span className="text-zinc-500">Format</span><span>{ratio}</span></div>
+              <div className="flex justify-between"><span className="text-zinc-500">Quality</span><span className="capitalize">{quality}</span></div>
             </div>
             <button disabled={!ready} onClick={() => setStep(2)} className="mt-7 flex w-full items-center justify-center gap-2 rounded-xl bg-violet-500 px-5 py-3.5 font-semibold hover:bg-violet-400 disabled:cursor-not-allowed disabled:opacity-40">
               Continue <ArrowRight size={18}/>

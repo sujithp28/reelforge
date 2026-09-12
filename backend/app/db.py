@@ -44,6 +44,7 @@ SCHEMA = [
         video_key     TEXT,
         music_volume  REAL NOT NULL DEFAULT 0.8,
         music_fade_out INTEGER NOT NULL DEFAULT 2,
+        quality       TEXT NOT NULL DEFAULT 'standard',
         created_at    TEXT NOT NULL,
         updated_at    TEXT NOT NULL
     )
@@ -68,7 +69,16 @@ SCHEMA = [
         duration     INTEGER NOT NULL,
         caption      TEXT,
         asset_id     TEXT REFERENCES assets(id) ON DELETE SET NULL,
-        regen_count  INTEGER NOT NULL DEFAULT 0
+        regen_count  INTEGER NOT NULL DEFAULT 0,
+        -- Per-scene clip cache. A scene whose inputs have not changed keeps
+        -- its clip, so retrying one failed scene does not pay to regenerate
+        -- the scenes that already succeeded.
+        clip_key     TEXT,
+        clip_hash    TEXT,
+        clip_status  TEXT NOT NULL DEFAULT 'pending',
+        clip_error   TEXT,
+        clip_attempts INTEGER NOT NULL DEFAULT 0,
+        clip_provider TEXT
     )
     """,
     """
@@ -79,14 +89,34 @@ SCHEMA = [
         progress    INTEGER NOT NULL DEFAULT 0,
         error       TEXT,
         provider    TEXT NOT NULL DEFAULT 'mock',
+        cancel_requested INTEGER NOT NULL DEFAULT 0,
         created_at  TEXT NOT NULL,
         updated_at  TEXT NOT NULL
+    )
+    """,
+    """
+    -- One row per generation attempt. Exists so spend on a billable provider
+    -- is auditable and a runaway loop is visible rather than silent.
+    CREATE TABLE IF NOT EXISTS scene_generations (
+        id          TEXT PRIMARY KEY,
+        project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        scene_id    TEXT NOT NULL REFERENCES scenes(id) ON DELETE CASCADE,
+        job_id      TEXT,
+        provider    TEXT NOT NULL,
+        attempt     INTEGER NOT NULL,
+        status      TEXT NOT NULL,
+        seconds     INTEGER,
+        elapsed_ms  INTEGER,
+        error       TEXT,
+        created_at  TEXT NOT NULL
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_scenes_project ON scenes(project_id, position)",
     "CREATE INDEX IF NOT EXISTS idx_assets_project ON assets(project_id)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_project ON render_jobs(project_id)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_status ON render_jobs(status)",
+    "CREATE INDEX IF NOT EXISTS idx_gen_scene ON scene_generations(scene_id)",
+    "CREATE INDEX IF NOT EXISTS idx_gen_project ON scene_generations(project_id)",
 ]
 
 # Columns added after the first release. Applied idempotently so an existing
@@ -97,6 +127,14 @@ MIGRATIONS = [
     ("projects", "music_fade_out", "INTEGER NOT NULL DEFAULT 2"),
     ("scenes", "regen_count", "INTEGER NOT NULL DEFAULT 0"),
     ("assets", "storage_key", "TEXT"),
+    ("projects", "quality", "TEXT NOT NULL DEFAULT 'standard'"),
+    ("scenes", "clip_key", "TEXT"),
+    ("scenes", "clip_hash", "TEXT"),
+    ("scenes", "clip_status", "TEXT NOT NULL DEFAULT 'pending'"),
+    ("scenes", "clip_error", "TEXT"),
+    ("scenes", "clip_attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("scenes", "clip_provider", "TEXT"),
+    ("render_jobs", "cancel_requested", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 

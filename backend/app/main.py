@@ -62,6 +62,7 @@ class ProjectRequest(BaseModel):
     )
     aspect_ratio: str = "9:16"
     title: str | None = Field(default=None, max_length=120)
+    quality: str | None = None
 
 
 class StoryboardRequest(BaseModel):
@@ -85,6 +86,10 @@ class SceneUpdate(BaseModel):
     )
 
 
+class QualityRequest(BaseModel):
+    quality: str
+
+
 class AudioSettingsRequest(BaseModel):
     music_volume: float | None = Field(default=None, ge=0.0, le=2.0)
     music_fade_out: int | None = Field(default=None, ge=0, le=10)
@@ -100,6 +105,37 @@ def _check_ratio(ratio: str) -> str:
     if ratio not in ALLOWED_RATIOS:
         raise HTTPException(422, f"aspect_ratio must be one of {sorted(ALLOWED_RATIOS)}")
     return ratio
+
+
+def _check_quality(quality: str | None) -> str:
+    chosen = (quality or config.DEFAULT_QUALITY).lower()
+    if chosen not in config.QUALITIES:
+        raise HTTPException(
+            422, f"quality must be one of {list(config.QUALITIES)}"
+        )
+    return chosen
+
+
+def _require_available_provider(name: str):
+    """Resolve a provider or refuse the request with a safe message.
+
+    Refusing here rather than mid-render means a misconfiguration never
+    leaves a half-generated project behind. The reason is logged for an
+    operator; the customer sees only that it is unavailable.
+    """
+    try:
+        generator = providers.build_generator(name)
+    except ffmpeg.RenderError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if not generator.available():
+        reason = providers.configuration_error(generator.name)
+        log.warning("provider %s unavailable: %s", generator.name, reason)
+        raise HTTPException(
+            503,
+            f"the {generator.name!r} video provider is not configured."
+            " Use provider 'mock' to render locally.",
+        )
+    return generator
 
 
 def _require_project(conn, project_id: str) -> dict:
@@ -121,6 +157,8 @@ def _serialize(conn, project: dict) -> dict:
     for scene in scenes:
         asset = by_id.get(scene.get("asset_id"))
         scene["asset_url"] = asset["url"] if asset else None
+        # Internal only: the browser never needs a storage key.
+        scene.pop("clip_key", None)
 
     out["scenes"] = scenes
     out["assets"] = assets
@@ -190,6 +228,7 @@ def list_projects(
 @app.post("/api/projects", status_code=201)
 def create_project(request: ProjectRequest):
     _check_ratio(request.aspect_ratio)
+    quality = _check_quality(request.quality)
     scenes = storyboard.plan_scenes(request.idea, request.category, request.duration)
     title = (request.title or request.idea).strip()[:120] or "Untitled reel"
 
@@ -203,6 +242,7 @@ def create_project(request: ProjectRequest):
             duration=request.duration,
             aspect_ratio=request.aspect_ratio,
         )
+        repo.set_quality(conn, project_id, quality)
         repo.insert_scenes(conn, project_id, scenes)
         # The planner is exact, but keep duration derived from the scenes so
         # there is one source of truth from the moment the project exists.
@@ -224,7 +264,24 @@ def delete_project(project_id: str):
     # Storage is cleaned after the row is gone: an orphaned file is recoverable,
     # a row pointing at a deleted file is not.
     storage.storage.delete_prefix(f"uploads/{project_id}")
+    storage.storage.delete_prefix(f"clips/{project_id}")
     storage.storage.delete_prefix(storage.render_key(project_id))
+
+
+@app.patch("/api/projects/{project_id}/quality")
+def update_quality(project_id: str, request: QualityRequest):
+    """Customer-facing quality. Maps to provider settings inside the provider."""
+    quality = _check_quality(request.quality)
+    with db.connect() as conn:
+        _require_project(conn, project_id)
+        repo.set_quality(conn, project_id, quality)
+        # Quality changes the generated pixels, so cached clips no longer apply.
+        stale = repo.clear_all_clips(conn, project_id)
+        repo.invalidate_render(conn, project_id)
+    for key in stale:
+        storage.storage.delete_prefix(key)
+    with db.connect() as conn:
+        return _serialize(conn, _require_project(conn, project_id))
 
 
 @app.patch("/api/projects/{project_id}/audio")
@@ -275,9 +332,15 @@ def update_scene(project_id: str, scene_id: str, update: SceneUpdate):
 
         if not repo.update_scene(conn, project_id, scene_id, fields):
             raise HTTPException(404, "scene not found")
+        # Only this scene's generated clip is now stale. Leaving the others
+        # cached is what stops one edit from re-billing the whole reel.
+        stale = repo.clear_clip(conn, project_id, scene_id)
         repo.invalidate_render(conn, project_id)
         repo.sync_project_duration(conn, project_id)
-        return _serialize(conn, _require_project(conn, project_id))
+        payload = _serialize(conn, _require_project(conn, project_id))
+    if stale:
+        storage.storage.delete_prefix(stale)
+    return payload
 
 
 @app.post("/api/projects/{project_id}/scenes/{scene_id}/regenerate")
@@ -293,8 +356,12 @@ def regenerate_scene(project_id: str, scene_id: str):
             project["idea"], project["category"], scene["title"], attempt
         )
         repo.bump_regeneration(conn, scene_id, prompt)
+        stale = repo.clear_clip(conn, project_id, scene_id)
         repo.invalidate_render(conn, project_id)
-        return _serialize(conn, _require_project(conn, project_id))
+        payload = _serialize(conn, _require_project(conn, project_id))
+    if stale:
+        storage.storage.delete_prefix(stale)
+    return payload
 
 
 # --- uploads ----------------------------------------------------------------
@@ -345,13 +412,20 @@ async def upload_asset(
         repo.insert_asset(
             conn, project_id, asset_id, kind, f"{asset_id}{suffix}", key
         )
+        stale: list[str] = []
         if kind == "image":
             if scene_id:
                 repo.attach_asset_to_scene(conn, project_id, scene_id, asset_id)
+                one = repo.clear_clip(conn, project_id, scene_id)
+                stale = [one] if one else []
             else:
                 repo.attach_asset_to_bare_scenes(conn, project_id, asset_id)
+                stale = repo.clear_all_clips(conn, project_id)
         repo.invalidate_render(conn, project_id)
-        return _serialize(conn, _require_project(conn, project_id))
+        payload = _serialize(conn, _require_project(conn, project_id))
+    for key in stale:
+        storage.storage.delete_prefix(key)
+    return payload
 
 
 # --- rendering --------------------------------------------------------------
@@ -362,17 +436,7 @@ def start_render(project_id: str, request: RenderRequest | None = None):
         raise HTTPException(503, "ffmpeg is not installed or not on PATH")
 
     name = (request.provider if request else None) or config.VIDEO_PROVIDER
-    try:
-        generator = providers.build_generator(name)
-    except ffmpeg.RenderError as exc:
-        raise HTTPException(422, str(exc)) from exc
-    if not generator.available():
-        # Reject here rather than failing halfway through a render.
-        raise HTTPException(
-            503,
-            f"the {generator.name!r} video provider is not configured."
-            " Use provider 'mock' to render locally.",
-        )
+    generator = _require_available_provider(name)
 
     with db.connect() as conn:
         _require_project(conn, project_id)
@@ -387,6 +451,65 @@ def start_render(project_id: str, request: RenderRequest | None = None):
         "id": project_id, "job_id": job_id, "status": "rendering",
         "progress": 0, "provider": generator.name,
     }
+
+
+@app.post("/api/projects/{project_id}/scenes/{scene_id}/retry", status_code=202)
+def retry_scene(project_id: str, scene_id: str):
+    """Regenerate one scene and reassemble, keeping every other scene's clip.
+
+    This is the answer to "Scene 2 isn't right": the other scenes are not
+    regenerated, so a retry costs one scene rather than the whole reel.
+    """
+    if not ffmpeg.ffmpeg_available():
+        raise HTTPException(503, "ffmpeg is not installed or not on PATH")
+
+    with db.connect() as conn:
+        _require_project(conn, project_id)
+        if repo.get_scene(conn, project_id, scene_id) is None:
+            raise HTTPException(404, "scene not found")
+
+    name = config.VIDEO_PROVIDER
+    generator = _require_available_provider(name)
+
+    with db.connect() as conn:
+        if not repo.claim_for_render(conn, project_id):
+            raise HTTPException(409, "this project is already rendering")
+        stale = repo.clear_clip(conn, project_id, scene_id)
+        job_id = repo.create_job(conn, project_id, generator.name)
+    if stale:
+        storage.storage.delete_prefix(stale)
+
+    jobs.submit(job_id, project_id)
+    return {
+        "id": project_id, "job_id": job_id, "scene_id": scene_id,
+        "status": "rendering", "progress": 0, "provider": generator.name,
+    }
+
+
+@app.post("/api/projects/{project_id}/jobs/{job_id}/cancel", status_code=202)
+def cancel_job(project_id: str, job_id: str):
+    """Ask a running render to stop. The worker checks between scenes."""
+    with db.connect() as conn:
+        _require_project(conn, project_id)
+        job = repo.get_job(conn, job_id)
+        if job is None or job["project_id"] != project_id:
+            raise HTTPException(404, "job not found")
+        if not repo.request_cancel(conn, job_id):
+            raise HTTPException(
+                409, f"this job is already {job['status']} and cannot be cancelled"
+            )
+    return {"job_id": job_id, "cancel_requested": True}
+
+
+@app.get("/api/projects/{project_id}/generations")
+def list_generations(
+    project_id: str,
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    """Generation audit trail. Operator-facing, carries no provider secrets."""
+    with db.connect() as conn:
+        _require_project(conn, project_id)
+        return {"generations": repo.list_generations(conn, project_id, limit)}
 
 
 @app.get("/api/projects/{project_id}/jobs/{job_id}")

@@ -42,6 +42,16 @@ jobs:
       - name: API tests (routes, validation, abstractions)
         run: python test_api.py
 
+      # Provider selection, chunking, aspect-ratio normalisation, failure
+      # handling, retry and scene isolation. Uses a fake HTTP transport for
+      # LTX: no credentials, no GPU, no billable calls.
+      - name: Generation provider tests
+        run: python test_generation.py
+
+      # Must skip cleanly rather than fail when no credentials are present.
+      - name: Real LTX tests skip without credentials
+        run: python test_ltx_integration.py
+
       - name: Import the app
         run: python -c "from app.main import app; print(app.title, app.version)"
 

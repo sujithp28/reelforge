@@ -16,7 +16,9 @@ from . import db
 from .db import new_id, rows_to_dicts
 
 # Statuses a project can be in. `rendering` is owned by the job worker.
-DRAFT, RENDERING, READY, FAILED = "draft", "rendering", "ready", "failed"
+DRAFT, RENDERING, READY, FAILED, CANCELLED = (
+    "draft", "rendering", "ready", "failed", "cancelled",
+)
 
 
 # --- projects ---------------------------------------------------------------
@@ -86,6 +88,13 @@ def update_audio_settings(
         db.sql(f"UPDATE projects SET {', '.join(sets)}, updated_at = {{now}}"
                " WHERE id = ?"),
         tuple(params),
+    )
+
+
+def set_quality(conn: Any, project_id: str, quality: str) -> None:
+    conn.execute(
+        db.sql("UPDATE projects SET quality = ?, updated_at = {now} WHERE id = ?"),
+        (quality, project_id),
     )
 
 
@@ -252,6 +261,107 @@ def bump_regeneration(conn: Any, scene_id: str, prompt: str) -> int:
     ).fetchone()["regen_count"])
 
 
+def set_clip_ready(
+    conn: Any, scene_id: str, *, key: str, clip_hash: str, provider: str
+) -> None:
+    conn.execute(
+        db.sql(
+            "UPDATE scenes SET clip_key = ?, clip_hash = ?, clip_status = 'ready',"
+            " clip_error = NULL, clip_provider = ? WHERE id = ?"
+        ),
+        (key, clip_hash, provider, scene_id),
+    )
+
+
+def set_clip_failed(
+    conn: Any, scene_id: str, *, clip_hash: str, provider: str, message: str
+) -> None:
+    """Record a scene-level failure without touching any other scene's clip."""
+    conn.execute(
+        db.sql(
+            "UPDATE scenes SET clip_status = 'failed', clip_error = ?,"
+            " clip_hash = ?, clip_provider = ?,"
+            " clip_attempts = clip_attempts + 1 WHERE id = ?"
+        ),
+        (message[:500], clip_hash, provider, scene_id),
+    )
+
+
+def clear_clip(conn: Any, project_id: str, scene_id: str) -> str | None:
+    """Forget a scene's cached clip so the next render regenerates just it.
+
+    Returns the storage key that is now unreferenced, for the caller to delete.
+    """
+    row = conn.execute(
+        db.sql("SELECT clip_key FROM scenes WHERE id = ? AND project_id = ?"),
+        (scene_id, project_id),
+    ).fetchone()
+    conn.execute(
+        db.sql(
+            "UPDATE scenes SET clip_key = NULL, clip_hash = NULL,"
+            " clip_status = 'pending', clip_error = NULL WHERE id = ?"
+        ),
+        (scene_id,),
+    )
+    return row["clip_key"] if row else None
+
+
+def clear_all_clips(conn: Any, project_id: str) -> list[str]:
+    """Invalidate every cached clip, returning the keys to delete."""
+    rows = conn.execute(
+        db.sql("SELECT clip_key FROM scenes WHERE project_id = ?"
+               " AND clip_key IS NOT NULL"),
+        (project_id,),
+    ).fetchall()
+    conn.execute(
+        db.sql(
+            "UPDATE scenes SET clip_key = NULL, clip_hash = NULL,"
+            " clip_status = 'pending', clip_error = NULL WHERE project_id = ?"
+        ),
+        (project_id,),
+    )
+    return [r["clip_key"] for r in rows]
+
+
+def log_generation(
+    conn: Any, *, project_id: str, scene_id: str, job_id: str | None,
+    provider: str, attempt: int, status: str, seconds: int | None = None,
+    elapsed_ms: int | None = None, error: str | None = None,
+) -> None:
+    """Audit one generation attempt.
+
+    Deliberately never receives a key, endpoint or raw provider payload — the
+    provider redacts before raising, and only its safe message arrives here.
+    """
+    conn.execute(
+        db.sql(
+            "INSERT INTO scene_generations (id, project_id, scene_id, job_id,"
+            " provider, attempt, status, seconds, elapsed_ms, error, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,{now})"
+        ),
+        (new_id("gen"), project_id, scene_id, job_id, provider, attempt, status,
+         seconds, elapsed_ms, (error or None) and error[:500]),
+    )
+
+
+def list_generations(conn: Any, project_id: str, limit: int = 100) -> list[dict]:
+    return rows_to_dicts(conn.execute(
+        db.sql(
+            "SELECT * FROM scene_generations WHERE project_id = ?"
+            " ORDER BY created_at DESC, id DESC LIMIT ?"
+        ),
+        (project_id, limit),
+    ))
+
+
+def count_generations(conn: Any, scene_id: str) -> int:
+    """Total attempts ever made for one scene, for cost visibility."""
+    return int(conn.execute(
+        db.sql("SELECT COUNT(*) AS n FROM scene_generations WHERE scene_id = ?"),
+        (scene_id,),
+    ).fetchone()["n"])
+
+
 def total_scene_seconds(conn: Any, project_id: str, exclude: str | None = None) -> int:
     query = "SELECT COALESCE(SUM(duration), 0) AS total FROM scenes WHERE project_id = ?"
     params: tuple = (project_id,)
@@ -355,6 +465,37 @@ def set_job_state(
         db.sql(f"UPDATE render_jobs SET {', '.join(sets)}, updated_at = {{now}}"
                " WHERE id = ?"),
         tuple(params),
+    )
+
+
+def request_cancel(conn: Any, job_id: str) -> bool:
+    """Ask a running job to stop. The worker checks this between scenes."""
+    changed = conn.execute(
+        db.sql(
+            "UPDATE render_jobs SET cancel_requested = 1, updated_at = {now}"
+            " WHERE id = ? AND status IN (?, ?)"
+        ),
+        (job_id, "queued", "running"),
+    ).rowcount
+    return bool(changed)
+
+
+def cancel_requested(conn: Any, job_id: str) -> bool:
+    row = conn.execute(
+        db.sql("SELECT cancel_requested FROM render_jobs WHERE id = ?"), (job_id,)
+    ).fetchone()
+    return bool(row and row["cancel_requested"])
+
+
+def mark_cancelled(conn: Any, project_id: str, job_id: str) -> None:
+    conn.execute(
+        db.sql("UPDATE projects SET status = ?, progress = 0,"
+               " updated_at = {now} WHERE id = ?"),
+        (DRAFT, project_id),
+    )
+    conn.execute(
+        db.sql("UPDATE render_jobs SET status = ?, updated_at = {now} WHERE id = ?"),
+        (CANCELLED, job_id),
     )
 
 

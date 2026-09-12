@@ -34,9 +34,31 @@ MEDIA_URL_PREFIX = "/media"
 # --- video generation -------------------------------------------------------
 # "mock" (default: ffmpeg stills and type cards, no GPU) or "ltx".
 VIDEO_PROVIDER = os.environ.get("REELFORGE_VIDEO_PROVIDER", "mock").lower()
-LTX_ENDPOINT = os.environ.get("REELFORGE_LTX_ENDPOINT", "")
+
+# Base URL of the LTX API. Points at the official hosted service by default;
+# override it to target a self-hosted deployment that speaks the same shape.
+LTX_ENDPOINT = os.environ.get("REELFORGE_LTX_ENDPOINT", "https://api.ltx.io")
+# Never hardcode this. Unset means the LTX provider reports itself unavailable.
 LTX_API_KEY = os.environ.get("REELFORGE_LTX_API_KEY", "")
-LTX_TIMEOUT_SECONDS = int(os.environ.get("REELFORGE_LTX_TIMEOUT", "600"))
+LTX_TIMEOUT_SECONDS = int(os.environ.get("REELFORGE_LTX_TIMEOUT", "900"))
+
+# Customer-facing quality maps to these models. Callers never see model names.
+LTX_MODEL_STANDARD = os.environ.get("REELFORGE_LTX_MODEL_STANDARD", "ltx-2-5-fast")
+LTX_MODEL_HIGH = os.environ.get("REELFORGE_LTX_MODEL_HIGH", "ltx-2-5-pro")
+LTX_RESOLUTION_TIER = os.environ.get("REELFORGE_LTX_RESOLUTION_TIER", "1080p")
+
+# Async job polling. The API documents a minimum of 5 seconds between polls.
+LTX_POLL_SECONDS = float(os.environ.get("REELFORGE_LTX_POLL_SECONDS", "6"))
+LTX_MAX_POLLS = int(os.environ.get("REELFORGE_LTX_MAX_POLLS", "150"))
+
+# Cost guards. A scene longer than the model's per-clip ceiling is generated in
+# chunks; these caps stop a misconfiguration from fanning out into many
+# billable calls.
+LTX_MAX_CHUNKS_PER_SCENE = int(os.environ.get("REELFORGE_LTX_MAX_CHUNKS", "6"))
+LTX_MAX_ATTEMPTS_PER_CHUNK = int(os.environ.get("REELFORGE_LTX_MAX_ATTEMPTS", "2"))
+
+QUALITIES = ("standard", "high")
+DEFAULT_QUALITY = os.environ.get("REELFORGE_DEFAULT_QUALITY", "standard").lower()
 
 # --- jobs -------------------------------------------------------------------
 # "thread" (default: in-process worker) or "external" (a separate worker

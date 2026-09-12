@@ -5,9 +5,11 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import {
   AlertTriangle, ArrowLeft, Check, Download, ImagePlus, Loader2, Music,
-  RefreshCw, WandSparkles,
+  RefreshCw, RotateCcw, WandSparkles, X,
 } from "lucide-react";
-import { api, mediaUrl, type Project, type Scene } from "../../../lib/api";
+import {
+  api, mediaUrl, QUALITIES, type Project, type Quality, type Scene,
+} from "../../../lib/api";
 
 const RATIO_CLASS: Record<string, string> = {
   "9:16": "aspect-[9/16]",
@@ -115,6 +117,8 @@ export default function ProjectPage() {
                 onRegenerate={() => act(`regen-${scene.id}`, () => api.regenerateScene(project.id, scene.id))}
                 onSave={patch => act(`save-${scene.id}`, () => api.updateScene(project.id, scene.id, patch))}
                 onUpload={file => act(`up-${scene.id}`, () => api.upload(project.id, file, scene.id))}
+                onRetry={() => act(`retry-${scene.id}`, () => api.retryScene(project.id, scene.id))}
+                canRetry={project.status !== "rendering"}
               />
             ))}
           </div>
@@ -151,11 +155,39 @@ export default function ProjectPage() {
                   : <>{project.status === "ready" ? "Re-generate reel" : "Generate reel"} <WandSparkles size={18}/></>}
               </button>
 
+              {project.status === "rendering" && project.job && (
+                <button
+                  onClick={() => act("cancel", () => api.cancelJob(project.id, project.job!.id))}
+                  disabled={pending === "cancel"}
+                  className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl border border-zinc-800 px-5 py-3 text-sm font-semibold text-zinc-300 hover:bg-zinc-950 disabled:opacity-50"
+                >
+                  <X size={16}/> Cancel
+                </button>
+              )}
+
               {videoUrl && (
                 <a href={videoUrl} download={`${project.title.slice(0, 40)}.mp4`} className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl border border-zinc-800 px-5 py-3 text-sm font-semibold text-zinc-200 hover:bg-zinc-950">
                   <Download size={16}/> Download MP4
                 </a>
               )}
+
+              <div className="mt-5 border-t border-zinc-800 pt-5">
+                <div className="flex items-center justify-between gap-3 text-sm">
+                  <label htmlFor="quality" className="text-zinc-400">Quality</label>
+                  <select
+                    id="quality"
+                    value={project.quality}
+                    disabled={project.status === "rendering" || pending === "quality"}
+                    onChange={e => act("quality", () => api.updateQuality(project.id, e.target.value as Quality))}
+                    className="rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm outline-none focus:border-violet-500 disabled:opacity-50"
+                  >
+                    {QUALITIES.map(q => (
+                      <option key={q.value} value={q.value}>{q.label}</option>
+                    ))}
+                  </select>
+                </div>
+                <p className="mt-2 text-xs text-zinc-600">Changing quality regenerates every scene.</p>
+              </div>
             </section>
 
             <section className="rounded-2xl border border-zinc-800 bg-zinc-900 p-6">
@@ -268,7 +300,7 @@ function StatusPill({ project }: { project: Project }) {
 }
 
 function SceneCard({
-  scene, index, pending, onRegenerate, onSave, onUpload,
+  scene, index, pending, onRegenerate, onSave, onUpload, onRetry, canRetry,
 }: {
   scene: Scene;
   index: number;
@@ -276,6 +308,8 @@ function SceneCard({
   onRegenerate: () => void;
   onSave: (patch: Partial<Pick<Scene, "title" | "prompt" | "caption" | "duration">>) => void;
   onUpload: (file: File) => void;
+  onRetry: () => void;
+  canRetry: boolean;
 }) {
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState(scene.title);
@@ -345,13 +379,36 @@ function SceneCard({
                 v{scene.regen_count + 1}
               </span>
             )}
+            {scene.clip_status === "ready" && (
+              <span title="This scene has been generated" className="rounded-full bg-emerald-500/15 px-2 py-1 text-xs text-emerald-300">Generated</span>
+            )}
+            {scene.clip_status === "failed" && (
+              <span className="rounded-full bg-amber-500/15 px-2 py-1 text-xs text-amber-300">Needs another try</span>
+            )}
             {scene.caption && <span className="rounded-full bg-violet-500/15 px-2 py-1 text-xs text-violet-300">“{scene.caption}”</span>}
           </div>
+          {scene.clip_status === "failed" && (
+            <p className="mt-2 text-sm text-amber-300/90">
+              {/* Backend messages are already customer-safe: no keys, URLs or stack traces. */}
+              {scene.clip_error || "This scene couldn’t be generated."}
+            </p>
+          )}
           <p className="mt-2 text-sm leading-6 text-zinc-400">{scene.prompt}</p>
         </div>
       )}
 
       <div className="flex gap-2 md:flex-col">
+        {scene.clip_status === "failed" && !editing ? (
+          <button
+            onClick={onRetry}
+            disabled={!canRetry || pending === `retry-${scene.id}`}
+            className="flex items-center gap-2 rounded-lg bg-amber-500/15 px-4 py-2 text-sm font-semibold text-amber-300 hover:bg-amber-500/25 disabled:opacity-50"
+          >
+            {pending === `retry-${scene.id}`
+              ? <Loader2 size={15} className="animate-spin"/>
+              : <RotateCcw size={15}/>} Try again
+          </button>
+        ) : null}
         {editing ? (
           <>
             <button

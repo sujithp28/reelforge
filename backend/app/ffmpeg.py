@@ -172,6 +172,58 @@ def build_music_mux_cmd(
     ]
 
 
+def build_normalize_cmd(
+    src: str, out: str, width: int, height: int, seconds: float | None = None,
+    fps: int = FPS, caption: str | None = None,
+) -> list[str]:
+    """Conform any clip to exact dimensions, frame rate and length.
+
+    Generation providers do not offer every aspect ratio or frame rate that
+    ReelForge does — LTX, for instance, produces only 16:9 and 9:16 at 24, 25,
+    48 or 50fps. This is where that gap is closed instead of letting it reach
+    the customer: scale to cover, centre-crop to the exact frame, and resample
+    to the pipeline frame rate.
+
+    `seconds` trims the output. Concatenation later stream-copies, so every
+    clip must agree on all three properties or the join is corrupt.
+    """
+    chain = [
+        f"scale={width}:{height}:force_original_aspect_ratio=increase",
+        f"crop={width}:{height}",
+        f"fps={fps}",
+    ]
+    if caption:
+        chain.append(_drawtext(caption, width, height, big=False))
+    chain.append("format=yuv420p")
+
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", src]
+    if seconds is not None:
+        cmd += ["-t", f"{seconds:.3f}"]
+    cmd += [
+        "-vf", ",".join(chain),
+        "-r", str(fps),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+        "-pix_fmt", "yuv420p", "-an",
+        out,
+    ]
+    return cmd
+
+
+def probe_duration(path: str) -> float | None:
+    """Seconds of media at `path`, or None if ffprobe cannot read it."""
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=nw=1:nk=1", path],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return None
+    try:
+        return float(proc.stdout.strip())
+    except ValueError:
+        return None
+
+
 def build_finalize_cmd(video: str, out: str) -> list[str]:
     """Remux for streaming when there is no soundtrack to add."""
     return [

@@ -6,6 +6,7 @@ contract, not the pixels.
 
     python test_api.py
 """
+import json
 import os
 import shutil
 import tempfile
@@ -383,6 +384,164 @@ def test_provider_registry():
         pass
     else:
         raise AssertionError("an unknown provider was accepted")
+
+
+def test_quality_is_customer_facing_only():
+    project = make_project()
+    assert project["quality"] == "standard"
+
+    res = client.patch(f"/api/projects/{project['id']}/quality",
+                       json={"quality": "high"})
+    assert res.status_code == 200, res.text
+    assert res.json()["quality"] == "high"
+
+    # No model identifier is ever returned at the API boundary. Checked
+    # against the real configured model names, not generic words like "pro"
+    # which legitimately appear inside "prompt" and "Product".
+    body = json.dumps(res.json()).lower()
+    for leak in ("ltx-2-5", config.LTX_MODEL_STANDARD, config.LTX_MODEL_HIGH):
+        assert leak.lower() not in body, leak
+
+    assert client.patch(f"/api/projects/{project['id']}/quality",
+                        json={"quality": "ultra"}).status_code == 422
+    assert client.patch(f"/api/projects/{project['id']}/quality",
+                        json={"quality": "ltx-2-5-pro"}).status_code == 422
+
+
+def test_quality_can_be_chosen_at_creation():
+    project = make_project(quality="high")
+    assert project["quality"] == "high"
+    res = client.post("/api/projects", json={
+        "idea": "x", "category": "Product", "duration": 18,
+        "aspect_ratio": "9:16", "quality": "nonsense",
+    })
+    assert res.status_code == 422
+
+
+def test_scene_retry_enqueues_a_job_for_one_scene():
+    if not ffmpeg.ffmpeg_available():
+        print("  (skipped scene retry test: ffmpeg not on PATH)")
+        return
+    project = make_project()
+    scene = project["scenes"][1]
+
+    res = client.post(f"/api/projects/{project['id']}/scenes/{scene['id']}/retry")
+    assert res.status_code == 202, res.text
+    body = res.json()
+    assert body["scene_id"] == scene["id"]
+    assert body["status"] == "rendering"
+    assert body["job_id"]
+
+    # Retrying an unknown scene must not enqueue anything.
+    assert client.post(
+        f"/api/projects/{project['id']}/scenes/scene_nope/retry"
+    ).status_code == 404
+    # And not while a render is already in flight.
+    assert client.post(
+        f"/api/projects/{project['id']}/scenes/{scene['id']}/retry"
+    ).status_code == 409
+
+
+def test_scene_edit_clears_only_that_scenes_clip():
+    """Editing one scene must not invalidate the others' cached clips."""
+    from app import db, repo
+
+    project = make_project()
+    scenes = project["scenes"]
+    with db.connect() as conn:
+        for i, s in enumerate(scenes):
+            repo.set_clip_ready(
+                conn, s["id"], key=f"clips/{project['id']}/{s['id']}_h{i}.mp4",
+                clip_hash=f"h{i}", provider="mock",
+            )
+
+    target = scenes[1]
+    client.patch(f"/api/projects/{project['id']}/scenes/{target['id']}",
+                 json={"prompt": "a different prompt"})
+
+    after = {s["id"]: s for s in
+             client.get(f"/api/projects/{project['id']}").json()["scenes"]}
+    assert after[target["id"]]["clip_status"] == "pending", "edited scene kept its clip"
+    for s in scenes:
+        if s["id"] != target["id"]:
+            assert after[s["id"]]["clip_status"] == "ready", (
+                f"scene {s['id']} lost its clip because a sibling was edited"
+            )
+
+
+def test_quality_change_clears_every_clip():
+    """Quality changes the pixels of every scene, so none can be reused."""
+    from app import db, repo
+
+    project = make_project()
+    with db.connect() as conn:
+        for i, s in enumerate(project["scenes"]):
+            repo.set_clip_ready(conn, s["id"], key=f"clips/x/{s['id']}.mp4",
+                                clip_hash=f"h{i}", provider="mock")
+
+    client.patch(f"/api/projects/{project['id']}/quality", json={"quality": "high"})
+    after = client.get(f"/api/projects/{project['id']}").json()["scenes"]
+    assert all(s["clip_status"] == "pending" for s in after), after
+
+
+def test_clip_keys_are_not_exposed_to_the_browser():
+    from app import db, repo
+
+    project = make_project()
+    with db.connect() as conn:
+        repo.set_clip_ready(conn, project["scenes"][0]["id"],
+                            key="clips/secret/internal_path.mp4",
+                            clip_hash="h", provider="mock")
+    body = client.get(f"/api/projects/{project['id']}").text
+    assert "internal_path" not in body
+    assert "clip_key" not in body
+
+
+def test_cancel_a_queued_job():
+    if not ffmpeg.ffmpeg_available():
+        print("  (skipped cancel test: ffmpeg not on PATH)")
+        return
+    project = make_project()
+    started = client.post(f"/api/projects/{project['id']}/render", json={}).json()
+    job_id = started["job_id"]
+
+    res = client.post(f"/api/projects/{project['id']}/jobs/{job_id}/cancel")
+    assert res.status_code == 202, res.text
+    assert res.json()["cancel_requested"] is True
+
+    job = client.get(f"/api/projects/{project['id']}/jobs/{job_id}").json()
+    assert job["cancel_requested"] == 1
+
+    assert client.post(
+        f"/api/projects/{project['id']}/jobs/job_nope/cancel"
+    ).status_code == 404
+
+
+def test_generation_log_records_attempts_without_secrets():
+    from app import db, repo
+
+    project = make_project()
+    scene = project["scenes"][0]
+    with db.connect() as conn:
+        repo.log_generation(
+            conn, project_id=project["id"], scene_id=scene["id"], job_id="job_x",
+            provider="ltx", attempt=1, status="failed", seconds=8,
+            elapsed_ms=4200, error="the video service could not generate this scene",
+        )
+    body = client.get(f"/api/projects/{project['id']}/generations")
+    assert body.status_code == 200
+    rows = body.json()["generations"]
+    assert len(rows) == 1
+    row = rows[0]
+    # Every field the cost/audit requirement asks for.
+    for field in ("project_id", "scene_id", "provider", "attempt", "status",
+                  "seconds", "created_at", "error"):
+        assert field in row, field
+    assert row["provider"] == "ltx" and row["attempt"] == 1
+    # And nothing resembling a credential or endpoint.
+    raw = json.dumps(rows).lower()
+    for leak in ("bearer", "api_key", "authorization", "api.ltx.io"):
+        assert leak not in raw, leak
 
 
 def test_restart_releases_orphaned_renders():

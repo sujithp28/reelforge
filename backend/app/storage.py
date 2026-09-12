@@ -26,11 +26,20 @@ def render_key(project_id: str) -> str:
     return f"renders/{project_id}.mp4"
 
 
+def clip_key(project_id: str, scene_id: str, fingerprint: str) -> str:
+    """Where one scene's generated clip is cached.
+
+    The fingerprint is in the key, so changing a scene's inputs writes a new
+    object instead of overwriting the old one mid-render.
+    """
+    return f"clips/{project_id}/{scene_id}_{fingerprint}.mp4"
+
+
 class Storage(Protocol):
     """Minimal surface the app needs. Implement all five for a new backend."""
 
     def save_bytes(self, key: str, payload: bytes) -> str: ...
-    def save_file(self, key: str, source: Path) -> str: ...
+    def save_file(self, key: str, source: Path, move: bool = True) -> str: ...
     def localize(self, key: str) -> Path | None: ...
     def url_for(self, key: str | None) -> str | None: ...
     def delete_prefix(self, prefix: str) -> None: ...
@@ -55,11 +64,19 @@ class LocalStorage:
         path.write_bytes(payload)
         return key
 
-    def save_file(self, key: str, source: Path) -> str:
+    def save_file(self, key: str, source: Path, move: bool = True) -> str:
+        """Store a file. `move=False` leaves the source in place.
+
+        A cached scene clip must be copied: the assembly step still needs the
+        original where it is.
+        """
         path = self._path(key)
         path.parent.mkdir(parents=True, exist_ok=True)
         if Path(source).resolve() != path:
-            shutil.move(str(source), path)
+            if move:
+                shutil.move(str(source), path)
+            else:
+                shutil.copy2(str(source), path)
         return key
 
     def localize(self, key: str) -> Path | None:
@@ -110,7 +127,7 @@ class S3Storage:
         self._unimplemented()
         raise AssertionError("unreachable")
 
-    def save_file(self, key: str, source: Path) -> str:
+    def save_file(self, key: str, source: Path, move: bool = True) -> str:
         self._unimplemented()
         raise AssertionError("unreachable")
 

@@ -11,6 +11,10 @@ project status contract all stay as they are, so the frontend never notices.
 Setting REELFORGE_JOB_RUNNER=external makes the API enqueue only, leaving the
 rows for a separate process to drain — which is how you verify the split is
 real before introducing a broker.
+
+This module also supplies render.py's hooks, which is where the scene clip
+cache and the generation audit log are actually written. That keeps database
+and storage access out of the render layer.
 """
 from __future__ import annotations
 
@@ -52,6 +56,78 @@ def run_job(job_id: str, project_id: str) -> None:
     finally:
         with _lock:
             _running.discard(job_id)
+
+
+class DbHooks:
+    """render.RenderHooks backed by the database and storage.
+
+    Every generation attempt is recorded here, which is what makes spend on a
+    billable provider auditable and a runaway loop visible.
+    """
+
+    def __init__(self, job_id: str, project_id: str, provider: str):
+        self.job_id = job_id
+        self.project_id = project_id
+        self.provider = provider
+
+    def should_cancel(self) -> bool:
+        with db.connect() as conn:
+            return repo.cancel_requested(conn, self.job_id)
+
+    def cached_clip(self, scene_id: str, fingerprint: str) -> Path | None:
+        """Reuse a previously generated clip whose inputs have not changed."""
+        with db.connect() as conn:
+            scene = conn.execute(
+                db.sql("SELECT clip_key, clip_hash, clip_status FROM scenes"
+                       " WHERE id = ?"),
+                (scene_id,),
+            ).fetchone()
+        if not scene or scene["clip_status"] != "ready":
+            return None
+        if scene["clip_hash"] != fingerprint or not scene["clip_key"]:
+            return None
+        local = storage.storage.localize(scene["clip_key"])
+        if local is None:
+            # Recorded but missing from storage; regenerate rather than fail.
+            log.warning("cached clip for scene %s is missing; regenerating", scene_id)
+            return None
+        log.info("reusing cached clip for scene %s", scene_id)
+        return local
+
+    def clip_succeeded(self, scene_id: str, fingerprint: str, clip: Path) -> None:
+        # Copied, not moved: assembly still needs the file where it is.
+        key = storage.clip_key(self.project_id, scene_id, fingerprint)
+        storage.storage.save_file(key, clip, move=False)
+        with db.connect() as conn:
+            conn.execute(
+                db.sql("UPDATE scenes SET clip_attempts = clip_attempts + 1"
+                       " WHERE id = ?"),
+                (scene_id,),
+            )
+            repo.set_clip_ready(
+                conn, scene_id, key=key, clip_hash=fingerprint,
+                provider=self.provider,
+            )
+
+    def clip_failed(self, scene_id: str, fingerprint: str, message: str) -> None:
+        with db.connect() as conn:
+            repo.set_clip_failed(
+                conn, scene_id, clip_hash=fingerprint,
+                provider=self.provider, message=message,
+            )
+
+    def generation_logged(
+        self, scene_id: str, status: str, seconds: int, elapsed_ms: int,
+        error: str | None,
+    ) -> None:
+        with db.connect() as conn:
+            attempt = repo.count_generations(conn, scene_id) + 1
+            repo.log_generation(
+                conn, project_id=self.project_id, scene_id=scene_id,
+                job_id=self.job_id, provider=self.provider, attempt=attempt,
+                status=status, seconds=seconds, elapsed_ms=elapsed_ms,
+                error=error,
+            )
 
 
 def _progress(job_id: str, project_id: str):
@@ -101,6 +177,8 @@ def _execute(job_id: str, project_id: str) -> None:
             generator=generator,
             audio=audio,
             on_progress=_progress(job_id, project_id),
+            hooks=DbHooks(job_id, project_id, generator.name),
+            quality=project.get("quality") or config.DEFAULT_QUALITY,
         )
 
         # The finished file only enters storage once, under a stable key.
@@ -116,6 +194,10 @@ def _execute(job_id: str, project_id: str) -> None:
             repo.set_job_state(conn, job_id, "succeeded", progress=100)
         log.info("job %s rendered project %s", job_id, project_id)
 
+    except render.RenderCancelled:
+        log.info("job %s cancelled", job_id)
+        with db.connect() as conn:
+            repo.mark_cancelled(conn, project_id, job_id)
     except (RenderError, OSError, ValueError) as exc:
         _fail(job_id, project_id, str(exc))
     except Exception as exc:  # unexpected: record it, do not lose the project
