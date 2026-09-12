@@ -101,7 +101,12 @@ def test_font_is_discoverable():
     assert render.find_font(), "no font found; set REELFORGE_FONT"
     arg = render._font_arg()
     assert arg.startswith("fontfile='") and arg.endswith("':"), arg
-    assert "\\:" in arg, "drive colon must stay escaped inside the quotes"
+    # Every colon in the path must be escaped or ffmpeg reads it as the
+    # separator before the next filter option. A Windows path has one from
+    # the drive letter; a POSIX path has none, so check the invariant rather
+    # than assuming either platform.
+    inner = arg[len("fontfile='"):-len("':")]
+    assert ":" not in inner.replace("\\:", ""), inner
 
 
 def test_still_clip_command_is_wellformed():
