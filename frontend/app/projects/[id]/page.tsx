@@ -175,6 +175,15 @@ export default function ProjectPage() {
                   }}
                 />
               </label>
+
+              {music && (
+                <AudioSettings
+                  volume={project.music_volume}
+                  fadeOut={project.music_fade_out}
+                  busy={pending === "audio"}
+                  onCommit={settings => act("audio", () => api.updateAudio(project.id, settings))}
+                />
+              )}
             </section>
 
             <section className="rounded-2xl border border-zinc-800 bg-zinc-900 p-6">
@@ -185,6 +194,61 @@ export default function ProjectPage() {
         </div>
       </div>
     </main>
+  );
+}
+
+const FADE_CHOICES = [0, 1, 2, 3, 5];
+
+function AudioSettings({
+  volume, fadeOut, busy, onCommit,
+}: {
+  volume: number;
+  fadeOut: number;
+  busy: boolean;
+  onCommit: (settings: { music_volume?: number; music_fade_out?: number }) => void;
+}) {
+  // Track the slider locally and only send on release: onChange fires per pixel,
+  // and each request re-renders the reel's status.
+  const [draft, setDraft] = useState(volume);
+  useEffect(() => setDraft(volume), [volume]);
+
+  return (
+    <div className="mt-5 space-y-4 border-t border-zinc-800 pt-5">
+      <div>
+        <div className="flex items-center justify-between text-sm">
+          <label htmlFor="music-volume" className="text-zinc-400">Volume</label>
+          <span className="text-zinc-300">{Math.round(draft * 100)}%</span>
+        </div>
+        <input
+          id="music-volume"
+          type="range"
+          min={0}
+          max={1.5}
+          step={0.05}
+          value={draft}
+          disabled={busy}
+          onChange={e => setDraft(Number(e.target.value))}
+          onPointerUp={() => draft !== volume && onCommit({ music_volume: draft })}
+          onKeyUp={() => draft !== volume && onCommit({ music_volume: draft })}
+          className="mt-2 w-full accent-violet-500"
+        />
+      </div>
+      <div className="flex items-center justify-between gap-3 text-sm">
+        <label htmlFor="music-fade" className="text-zinc-400">Fade out</label>
+        <select
+          id="music-fade"
+          value={fadeOut}
+          disabled={busy}
+          onChange={e => onCommit({ music_fade_out: Number(e.target.value) })}
+          className="rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm outline-none focus:border-violet-500"
+        >
+          {FADE_CHOICES.map(s => (
+            <option key={s} value={s}>{s === 0 ? "None" : `${s}s`}</option>
+          ))}
+        </select>
+      </div>
+      <p className="text-xs text-zinc-600">Changing the mix re-renders the reel.</p>
+    </div>
   );
 }
 
@@ -273,6 +337,14 @@ function SceneCard({
           <div className="flex flex-wrap items-center gap-3">
             <h2 className="font-semibold">{scene.title}</h2>
             <span className="rounded-full bg-zinc-800 px-2 py-1 text-xs text-zinc-400">{scene.duration}s</span>
+            {scene.regen_count > 0 && (
+              <span
+                title={`Regenerated ${scene.regen_count} time${scene.regen_count === 1 ? "" : "s"}`}
+                className="rounded-full bg-zinc-800 px-2 py-1 text-xs text-zinc-400"
+              >
+                v{scene.regen_count + 1}
+              </span>
+            )}
             {scene.caption && <span className="rounded-full bg-violet-500/15 px-2 py-1 text-xs text-violet-300">“{scene.caption}”</span>}
           </div>
           <p className="mt-2 text-sm leading-6 text-zinc-400">{scene.prompt}</p>

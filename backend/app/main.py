@@ -1,40 +1,65 @@
+"""HTTP layer.
+
+Routes validate input, call repo.py inside one transaction, and enqueue jobs.
+No SQL, no ffmpeg, no filesystem paths live here.
+"""
+from __future__ import annotations
+
+import logging
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import db, render, storyboard
+from . import config, db, ffmpeg, jobs, providers, repo, storage, storyboard
 
-app = FastAPI(title="ReelForge API", version="1.0.0")
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("reelforge")
+
+app = FastAPI(title="ReelForge API", version="1.1.0")
 
 # The Next.js dev server runs on a different origin, so without this every
 # browser request fails preflight.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=config.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 db.init()
-# Uploaded stills and finished reels are served straight off disk.
-app.mount("/media/uploads", StaticFiles(directory=db.UPLOAD_DIR), name="uploads")
-app.mount("/media/renders", StaticFiles(directory=db.RENDER_DIR), name="renders")
+with db.connect() as _conn:
+    _released = repo.release_stale_renders(_conn)
+if _released:
+    log.warning("released %d render(s) orphaned by a restart", _released)
+
+# Local storage is served by the app. With REELFORGE_STORAGE=s3 the keys are
+# identical and url_for returns absolute URLs instead, so this mount becomes
+# unnecessary rather than wrong.
+if config.STORAGE_BACKEND == "local":
+    app.mount(
+        config.MEDIA_URL_PREFIX,
+        StaticFiles(directory=config.DATA_DIR),
+        name="media",
+    )
 
 ALLOWED_RATIOS = set(storyboard.ASPECT_SIZES)
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 AUDIO_SUFFIXES = {".mp3", ".m4a", ".aac", ".wav", ".ogg"}
-MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
+
+# --- request models ---------------------------------------------------------
 
 class ProjectRequest(BaseModel):
     idea: str = Field(min_length=1, max_length=2000)
     category: str = "Cinematic"
     input_type: str = "Idea"
-    duration: int = Field(default=30, ge=5, le=120)
+    duration: int = Field(
+        default=30, ge=config.MIN_REEL_SECONDS, le=config.MAX_REEL_SECONDS
+    )
     aspect_ratio: str = "9:16"
     title: str | None = Field(default=None, max_length=120)
 
@@ -43,7 +68,9 @@ class StoryboardRequest(BaseModel):
     """Preview-only planner, kept for the original /api/storyboard endpoint."""
     idea: str
     category: str = "Cinematic"
-    duration: int = Field(default=30, ge=5, le=120)
+    duration: int = Field(
+        default=30, ge=config.MIN_REEL_SECONDS, le=config.MAX_REEL_SECONDS
+    )
     aspect_ratio: str = "9:16"
 
 
@@ -51,8 +78,23 @@ class SceneUpdate(BaseModel):
     title: str | None = Field(default=None, max_length=120)
     prompt: str | None = Field(default=None, max_length=2000)
     caption: str | None = Field(default=None, max_length=200)
-    duration: int | None = Field(default=None, ge=1, le=30)
+    duration: int | None = Field(
+        default=None,
+        ge=config.MIN_SCENE_SECONDS_ALLOWED,
+        le=config.MAX_SCENE_SECONDS_ALLOWED,
+    )
 
+
+class AudioSettingsRequest(BaseModel):
+    music_volume: float | None = Field(default=None, ge=0.0, le=2.0)
+    music_fade_out: int | None = Field(default=None, ge=0, le=10)
+
+
+class RenderRequest(BaseModel):
+    provider: str | None = None
+
+
+# --- helpers ----------------------------------------------------------------
 
 def _check_ratio(ratio: str) -> str:
     if ratio not in ALLOWED_RATIOS:
@@ -60,40 +102,62 @@ def _check_ratio(ratio: str) -> str:
     return ratio
 
 
-def _project_row(conn, project_id: str):
-    row = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
-    if row is None:
+def _require_project(conn, project_id: str) -> dict:
+    project = repo.get_project(conn, project_id)
+    if project is None:
         raise HTTPException(404, "project not found")
-    return row
+    return project
 
 
-def _serialize(conn, row) -> dict:
-    project = dict(row)
-    scenes = db.rows_to_dicts(conn.execute(
-        "SELECT * FROM scenes WHERE project_id = ? ORDER BY position", (row["id"],)
-    ))
-    assets = db.rows_to_dicts(conn.execute(
-        "SELECT id, kind, filename FROM assets WHERE project_id = ? ORDER BY created_at",
-        (row["id"],),
-    ))
+def _serialize(conn, project: dict) -> dict:
+    """Build the project payload. This shape is the frontend contract."""
+    out = dict(project)
+    scenes = repo.list_scenes(conn, project["id"])
+    assets = repo.list_assets(conn, project["id"])
+
     for asset in assets:
-        asset["url"] = f"/media/uploads/{project['id']}/{asset['filename']}"
+        asset["url"] = storage.storage.url_for(asset.pop("storage_key", None))
     by_id = {a["id"]: a for a in assets}
     for scene in scenes:
         asset = by_id.get(scene.get("asset_id"))
         scene["asset_url"] = asset["url"] if asset else None
-    project["scenes"] = scenes
-    project["assets"] = assets
-    project["total_duration"] = sum(s["duration"] for s in scenes)
-    video = project.pop("video_path", None)
-    project["video_url"] = f"/media/renders/{Path(video).name}" if video else None
-    return project
 
+    out["scenes"] = scenes
+    out["assets"] = assets
+    out["total_duration"] = sum(s["duration"] for s in scenes)
+    out["video_url"] = storage.storage.url_for(out.pop("video_key", None))
+    job = repo.latest_job(conn, project["id"])
+    out["job"] = (
+        {"id": job["id"], "status": job["status"], "provider": job["provider"]}
+        if job else None
+    )
+    return out
+
+
+def _summarize(project: dict) -> dict:
+    out = dict(project)
+    out["video_url"] = storage.storage.url_for(out.pop("video_key", None))
+    return out
+
+
+# --- health -----------------------------------------------------------------
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "reelforge-api", "ffmpeg": render.ffmpeg_available()}
+    return {
+        "status": "ok",
+        "service": "reelforge-api",
+        "ffmpeg": ffmpeg.ffmpeg_available(),
+        "font": bool(ffmpeg.find_font()),
+        "db_dialect": config.DB_DIALECT,
+        "storage": config.STORAGE_BACKEND,
+        "job_runner": config.JOB_RUNNER,
+        "video_provider": config.VIDEO_PROVIDER,
+        "providers": providers.available_providers(),
+    }
 
+
+# --- storyboard preview -----------------------------------------------------
 
 @app.post("/api/storyboard")
 def create_storyboard(request: StoryboardRequest):
@@ -108,107 +172,132 @@ def create_storyboard(request: StoryboardRequest):
     }
 
 
+# --- projects ---------------------------------------------------------------
+
 @app.get("/api/projects")
-def list_projects():
+def list_projects(
+    limit: int = Query(default=100, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
     with db.connect() as conn:
-        rows = conn.execute(
-            "SELECT p.*, (SELECT COUNT(*) FROM scenes s WHERE s.project_id = p.id)"
-            " AS scene_count FROM projects p ORDER BY p.created_at DESC"
-        ).fetchall()
-        out = []
-        for row in rows:
-            item = dict(row)
-            video = item.pop("video_path", None)
-            item["video_url"] = f"/media/renders/{Path(video).name}" if video else None
-            out.append(item)
-        return {"projects": out}
+        rows = repo.list_projects(conn, limit=limit, offset=offset)
+        return {
+            "projects": [_summarize(r) for r in rows],
+            "total": repo.count_projects(conn),
+        }
 
 
 @app.post("/api/projects", status_code=201)
 def create_project(request: ProjectRequest):
     _check_ratio(request.aspect_ratio)
-    project_id = db.new_id("proj")
     scenes = storyboard.plan_scenes(request.idea, request.category, request.duration)
     title = (request.title or request.idea).strip()[:120] or "Untitled reel"
 
     with db.connect() as conn:
-        conn.execute(
-            "INSERT INTO projects (id, title, idea, category, input_type, duration,"
-            " aspect_ratio) VALUES (?,?,?,?,?,?,?)",
-            (project_id, title, request.idea, request.category, request.input_type,
-             request.duration, request.aspect_ratio),
+        project_id = repo.create_project(
+            conn,
+            title=title,
+            idea=request.idea,
+            category=request.category,
+            input_type=request.input_type,
+            duration=request.duration,
+            aspect_ratio=request.aspect_ratio,
         )
-        conn.executemany(
-            "INSERT INTO scenes (id, project_id, position, title, prompt, duration,"
-            " caption) VALUES (?,?,?,?,?,?,?)",
-            [(db.new_id("scene"), project_id, s["position"], s["title"], s["prompt"],
-              s["duration"], s["caption"]) for s in scenes],
-        )
-        return _serialize(conn, _project_row(conn, project_id))
+        repo.insert_scenes(conn, project_id, scenes)
+        # The planner is exact, but keep duration derived from the scenes so
+        # there is one source of truth from the moment the project exists.
+        repo.sync_project_duration(conn, project_id)
+        return _serialize(conn, _require_project(conn, project_id))
 
 
 @app.get("/api/projects/{project_id}")
 def get_project(project_id: str):
     with db.connect() as conn:
-        return _serialize(conn, _project_row(conn, project_id))
+        return _serialize(conn, _require_project(conn, project_id))
 
 
 @app.delete("/api/projects/{project_id}", status_code=204)
 def delete_project(project_id: str):
     with db.connect() as conn:
-        _project_row(conn, project_id)
-        conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
-    for path in (db.UPLOAD_DIR / project_id, db.RENDER_DIR / project_id):
-        if path.exists():
-            for child in path.rglob("*"):
-                child.unlink(missing_ok=True)
-            path.rmdir()
-    (db.RENDER_DIR / f"{project_id}.mp4").unlink(missing_ok=True)
+        _require_project(conn, project_id)
+        repo.delete_project(conn, project_id)
+    # Storage is cleaned after the row is gone: an orphaned file is recoverable,
+    # a row pointing at a deleted file is not.
+    storage.storage.delete_prefix(f"uploads/{project_id}")
+    storage.storage.delete_prefix(storage.render_key(project_id))
 
+
+@app.patch("/api/projects/{project_id}/audio")
+def update_audio(project_id: str, request: AudioSettingsRequest):
+    if request.music_volume is None and request.music_fade_out is None:
+        raise HTTPException(422, "provide music_volume or music_fade_out")
+    with db.connect() as conn:
+        _require_project(conn, project_id)
+        repo.update_audio_settings(
+            conn, project_id,
+            volume=request.music_volume, fade_out=request.music_fade_out,
+        )
+        repo.invalidate_render(conn, project_id)
+        return _serialize(conn, _require_project(conn, project_id))
+
+
+# --- scenes -----------------------------------------------------------------
 
 @app.patch("/api/projects/{project_id}/scenes/{scene_id}")
 def update_scene(project_id: str, scene_id: str, update: SceneUpdate):
-    fields = {k: v for k, v in update.model_dump().items() if v is not None}
+    fields = {k: v for k, v in update.model_dump(exclude_unset=True).items()
+              if v is not None}
     if not fields:
         raise HTTPException(422, "no fields to update")
+
     with db.connect() as conn:
-        _project_row(conn, project_id)
-        assignments = ", ".join(f"{k} = ?" for k in fields)
-        changed = conn.execute(
-            f"UPDATE scenes SET {assignments} WHERE id = ? AND project_id = ?",
-            (*fields.values(), scene_id, project_id),
-        ).rowcount
-        if not changed:
+        _require_project(conn, project_id)
+        if repo.get_scene(conn, project_id, scene_id) is None:
             raise HTTPException(404, "scene not found")
-        # Editing a scene invalidates the rendered video.
-        conn.execute(
-            "UPDATE projects SET status = 'draft', progress = 0, video_path = NULL,"
-            " updated_at = datetime('now') WHERE id = ?", (project_id,),
-        )
-        return _serialize(conn, _project_row(conn, project_id))
+
+        # A per-scene cap alone lets 8 scenes reach 240s in a "30-second reel",
+        # so validate the resulting total, not just this one scene.
+        if "duration" in fields:
+            others = repo.total_scene_seconds(conn, project_id, exclude=scene_id)
+            total = others + int(fields["duration"])
+            if total > config.MAX_REEL_SECONDS:
+                raise HTTPException(
+                    422,
+                    f"that would make the reel {total}s;"
+                    f" the maximum is {config.MAX_REEL_SECONDS}s",
+                )
+            if total < config.MIN_REEL_SECONDS:
+                raise HTTPException(
+                    422,
+                    f"that would make the reel {total}s;"
+                    f" the minimum is {config.MIN_REEL_SECONDS}s",
+                )
+
+        if not repo.update_scene(conn, project_id, scene_id, fields):
+            raise HTTPException(404, "scene not found")
+        repo.invalidate_render(conn, project_id)
+        repo.sync_project_duration(conn, project_id)
+        return _serialize(conn, _require_project(conn, project_id))
 
 
 @app.post("/api/projects/{project_id}/scenes/{scene_id}/regenerate")
 def regenerate_scene(project_id: str, scene_id: str):
     with db.connect() as conn:
-        project = _project_row(conn, project_id)
-        scene = conn.execute(
-            "SELECT * FROM scenes WHERE id = ? AND project_id = ?", (scene_id, project_id)
-        ).fetchone()
+        project = _require_project(conn, project_id)
+        scene = repo.get_scene(conn, project_id, scene_id)
         if scene is None:
             raise HTTPException(404, "scene not found")
-        # Cycle a style variation each time the user asks again.
-        attempt = len(scene["prompt"].split(" — "))
+
+        attempt = int(scene.get("regen_count", 0)) + 1
         prompt = storyboard.reprompt_scene(
             project["idea"], project["category"], scene["title"], attempt
         )
-        conn.execute("UPDATE scenes SET prompt = ? WHERE id = ?", (prompt, scene_id))
-        conn.execute(
-            "UPDATE projects SET status = 'draft', progress = 0, video_path = NULL,"
-            " updated_at = datetime('now') WHERE id = ?", (project_id,),
-        )
-        return _serialize(conn, _project_row(conn, project_id))
+        repo.bump_regeneration(conn, scene_id, prompt)
+        repo.invalidate_render(conn, project_id)
+        return _serialize(conn, _require_project(conn, project_id))
 
+
+# --- uploads ----------------------------------------------------------------
 
 @app.post("/api/projects/{project_id}/uploads", status_code=201)
 async def upload_asset(
@@ -227,113 +316,84 @@ async def upload_asset(
                  f" images {sorted(IMAGE_SUFFIXES)} or audio {sorted(AUDIO_SUFFIXES)}"
         )
 
-    payload = await file.read()
+    # Read in chunks and stop at the limit rather than buffering an arbitrarily
+    # large body first and checking its size afterwards.
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(1024 * 256)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > config.MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                413, f"file exceeds {config.MAX_UPLOAD_BYTES // (1024 * 1024)}MB"
+            )
+        chunks.append(chunk)
+    payload = b"".join(chunks)
     if not payload:
         raise HTTPException(422, "uploaded file is empty")
-    if len(payload) > MAX_UPLOAD_BYTES:
-        raise HTTPException(413, f"file exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)}MB")
 
     with db.connect() as conn:
-        _project_row(conn, project_id)
+        _require_project(conn, project_id)
+        if scene_id and repo.get_scene(conn, project_id, scene_id) is None:
+            raise HTTPException(404, "scene not found")
+
         asset_id = db.new_id("asset")
-        filename = f"{asset_id}{suffix}"
-        folder = db.UPLOAD_DIR / project_id
-        folder.mkdir(parents=True, exist_ok=True)
-        (folder / filename).write_bytes(payload)
-        conn.execute(
-            "INSERT INTO assets (id, project_id, kind, filename, stored_path)"
-            " VALUES (?,?,?,?,?)",
-            (asset_id, project_id, kind, filename, str(folder / filename)),
+        key = storage.upload_key(project_id, asset_id, suffix)
+        storage.storage.save_bytes(key, payload)
+        repo.insert_asset(
+            conn, project_id, asset_id, kind, f"{asset_id}{suffix}", key
         )
         if kind == "image":
             if scene_id:
-                conn.execute(
-                    "UPDATE scenes SET asset_id = ? WHERE id = ? AND project_id = ?",
-                    (asset_id, scene_id, project_id),
-                )
+                repo.attach_asset_to_scene(conn, project_id, scene_id, asset_id)
             else:
-                # No scene named: seed every scene that has no still yet.
-                conn.execute(
-                    "UPDATE scenes SET asset_id = ? WHERE project_id = ?"
-                    " AND asset_id IS NULL", (asset_id, project_id),
-                )
-        conn.execute(
-            "UPDATE projects SET status = 'draft', progress = 0, video_path = NULL,"
-            " updated_at = datetime('now') WHERE id = ?", (project_id,),
-        )
-        return _serialize(conn, _project_row(conn, project_id))
+                repo.attach_asset_to_bare_scenes(conn, project_id, asset_id)
+        repo.invalidate_render(conn, project_id)
+        return _serialize(conn, _require_project(conn, project_id))
 
 
-def _do_render(project_id: str) -> None:
-    """Runs on a background task. Owns its own connection."""
-    def progress(pct: int) -> None:
-        with db.connect() as conn:
-            conn.execute(
-                "UPDATE projects SET progress = ?, updated_at = datetime('now')"
-                " WHERE id = ?", (pct, project_id),
-            )
-
-    try:
-        with db.connect() as conn:
-            project = dict(_project_row(conn, project_id))
-            scenes = db.rows_to_dicts(conn.execute(
-                "SELECT * FROM scenes WHERE project_id = ? ORDER BY position",
-                (project_id,),
-            ))
-            images = {}
-            for scene in scenes:
-                if scene["asset_id"]:
-                    row = conn.execute(
-                        "SELECT stored_path FROM assets WHERE id = ?", (scene["asset_id"],)
-                    ).fetchone()
-                    images[scene["id"]] = row["stored_path"] if row else None
-            music_row = conn.execute(
-                "SELECT stored_path FROM assets WHERE project_id = ? AND kind = 'audio'"
-                " ORDER BY created_at DESC LIMIT 1", (project_id,),
-            ).fetchone()
-
-        out_path = db.RENDER_DIR / f"{project_id}.mp4"
-        render.render_reel(
-            scenes=scenes,
-            images=images,
-            aspect_ratio=project["aspect_ratio"],
-            work_dir=db.RENDER_DIR / f"{project_id}_work",
-            out_path=out_path,
-            music=music_row["stored_path"] if music_row else None,
-            on_progress=progress,
-        )
-        with db.connect() as conn:
-            conn.execute(
-                "UPDATE projects SET status = 'ready', progress = 100, error = NULL,"
-                " video_path = ?, updated_at = datetime('now') WHERE id = ?",
-                (str(out_path), project_id),
-            )
-    except Exception as exc:  # surfaced to the user via project.error
-        with db.connect() as conn:
-            conn.execute(
-                "UPDATE projects SET status = 'failed', error = ?,"
-                " updated_at = datetime('now') WHERE id = ?",
-                (str(exc)[:500], project_id),
-            )
-    finally:
-        work = db.RENDER_DIR / f"{project_id}_work"
-        if work.exists():
-            for child in work.rglob("*"):
-                child.unlink(missing_ok=True)
-            work.rmdir()
-
+# --- rendering --------------------------------------------------------------
 
 @app.post("/api/projects/{project_id}/render", status_code=202)
-def start_render(project_id: str, background: BackgroundTasks):
-    if not render.ffmpeg_available():
+def start_render(project_id: str, request: RenderRequest | None = None):
+    if not ffmpeg.ffmpeg_available():
         raise HTTPException(503, "ffmpeg is not installed or not on PATH")
-    with db.connect() as conn:
-        project = _project_row(conn, project_id)
-        if project["status"] == "rendering":
-            raise HTTPException(409, "this project is already rendering")
-        conn.execute(
-            "UPDATE projects SET status = 'rendering', progress = 0, error = NULL,"
-            " updated_at = datetime('now') WHERE id = ?", (project_id,),
+
+    name = (request.provider if request else None) or config.VIDEO_PROVIDER
+    try:
+        generator = providers.build_generator(name)
+    except ffmpeg.RenderError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if not generator.available():
+        # Reject here rather than failing halfway through a render.
+        raise HTTPException(
+            503,
+            f"the {generator.name!r} video provider is not configured."
+            " Use provider 'mock' to render locally.",
         )
-    background.add_task(_do_render, project_id)
-    return {"id": project_id, "status": "rendering", "progress": 0}
+
+    with db.connect() as conn:
+        _require_project(conn, project_id)
+        if not repo.claim_for_render(conn, project_id):
+            raise HTTPException(409, "this project is already rendering")
+        job_id = repo.create_job(conn, project_id, generator.name)
+
+    # Execution happens outside the request. Replacing this with a broker
+    # publish is the only change a real queue needs.
+    jobs.submit(job_id, project_id)
+    return {
+        "id": project_id, "job_id": job_id, "status": "rendering",
+        "progress": 0, "provider": generator.name,
+    }
+
+
+@app.get("/api/projects/{project_id}/jobs/{job_id}")
+def get_job(project_id: str, job_id: str):
+    with db.connect() as conn:
+        _require_project(conn, project_id)
+        job = repo.get_job(conn, job_id)
+        if job is None or job["project_id"] != project_id:
+            raise HTTPException(404, "job not found")
+        return job

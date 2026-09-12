@@ -25,6 +25,8 @@ export type Scene = {
   caption: string | null;
   asset_id: string | null;
   asset_url: string | null;
+  /** How many times this scene's prompt has been regenerated. */
+  regen_count: number;
 };
 
 export type Asset = { id: string; kind: "image" | "audio"; filename: string; url: string };
@@ -42,15 +44,24 @@ export type Project = {
   error: string | null;
   video_url: string | null;
   total_duration: number;
+  music_volume: number;
+  music_fade_out: number;
   created_at: string;
   updated_at: string;
   scenes: Scene[];
   assets: Asset[];
+  job: { id: string; status: string; provider: string } | null;
 };
 
-export type ProjectSummary = Omit<Project, "scenes" | "assets" | "total_duration"> & {
-  scene_count: number;
-};
+export type ProjectSummary = Omit<
+  Project,
+  "scenes" | "assets" | "total_duration" | "job"
+> & { scene_count: number };
+
+/** Backend limits, mirrored so the UI can stop an edit before it round-trips. */
+export const MIN_REEL_SECONDS = 5;
+export const MAX_REEL_SECONDS = 120;
+export const MAX_SCENE_SECONDS = 30;
 
 /** Turn a `/media/...` path from the API into something an <img>/<video> can load. */
 export function mediaUrl(path: string | null): string | null {
@@ -101,8 +112,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   health: () => request<{ status: string; ffmpeg: boolean }>("/health"),
 
-  listProjects: () =>
-    request<{ projects: ProjectSummary[] }>("/api/projects").then((r) => r.projects),
+  listProjects: (limit = 100, offset = 0) =>
+    request<{ projects: ProjectSummary[]; total: number }>(
+      `/api/projects?limit=${limit}&offset=${offset}`,
+    ).then((r) => r.projects),
 
   getProject: (id: string) => request<Project>(`/api/projects/${id}`),
 
@@ -141,8 +154,19 @@ export const api = {
     });
   },
 
-  render: (projectId: string) =>
-    request<{ id: string; status: string }>(`/api/projects/${projectId}/render`, {
-      method: "POST",
+  updateAudio: (
+    projectId: string,
+    settings: { music_volume?: number; music_fade_out?: number },
+  ) =>
+    request<Project>(`/api/projects/${projectId}/audio`, {
+      method: "PATCH",
+      body: JSON.stringify(settings),
     }),
+
+  /** `provider` defaults to the backend's configured generator (mock locally). */
+  render: (projectId: string, provider?: string) =>
+    request<{ id: string; job_id: string; status: string; provider: string }>(
+      `/api/projects/${projectId}/render`,
+      { method: "POST", body: JSON.stringify({ provider: provider ?? null }) },
+    ),
 };

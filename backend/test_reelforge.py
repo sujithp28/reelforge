@@ -3,7 +3,7 @@ building. Plain asserts, no test framework.
 
     python test_reelforge.py
 """
-from app import render, storyboard
+from app import ffmpeg, storyboard
 
 
 def test_split_duration_sums_exactly():
@@ -86,7 +86,7 @@ def test_resolution_for():
 
 def test_drawtext_escaping():
     # Unescaped colons and percents break the whole ffmpeg filtergraph.
-    out = render.escape_drawtext("Price: 20% off, it's [real]\nsecond line")
+    out = ffmpeg.escape_drawtext("Price: 20% off, it's [real]\nsecond line")
     for ch in (":", "%", ",", "[", "]"):
         assert "\\" + ch in out, (ch, out)
     # Apostrophes cannot be escaped inside a single-quoted value at all.
@@ -98,8 +98,8 @@ def test_drawtext_escaping():
 def test_font_is_discoverable():
     # Captions are impossible without an explicit fontfile where fontconfig
     # is absent, which includes a default Windows install.
-    assert render.find_font(), "no font found; set REELFORGE_FONT"
-    arg = render._font_arg()
+    assert ffmpeg.find_font(), "no font found; set REELFORGE_FONT"
+    arg = ffmpeg._font_arg()
     assert arg.startswith("fontfile='") and arg.endswith("':"), arg
     # Every colon in the path must be escaped or ffmpeg reads it as the
     # separator before the next filter option. A Windows path has one from
@@ -110,7 +110,7 @@ def test_font_is_discoverable():
 
 
 def test_still_clip_command_is_wellformed():
-    cmd = render.build_still_clip_cmd(
+    cmd = ffmpeg.build_still_clip_cmd(
         image="in.jpg", out="out.mp4", seconds=7, width=1080, height=1920, caption="Hi"
     )
     assert cmd[0] == "ffmpeg"
@@ -121,7 +121,7 @@ def test_still_clip_command_is_wellformed():
 
 
 def test_card_clip_command_has_no_input_file():
-    cmd = render.build_card_clip_cmd(
+    cmd = ffmpeg.build_card_clip_cmd(
         out="out.mp4", seconds=4, width=1080, height=1920, caption="Closing", index=2
     )
     assert "lavfi" in cmd
@@ -129,7 +129,7 @@ def test_card_clip_command_has_no_input_file():
 
 
 def test_concat_file_escapes_quotes():
-    body = render.build_concat_list(["a b.mp4", "it's.mp4"])
+    body = ffmpeg.build_concat_list(["a b.mp4", "it's.mp4"])
     assert "'a b.mp4'" in body
     assert "it'\\''s.mp4" in body or "it\\'s.mp4" in body, body
 

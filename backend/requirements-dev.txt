@@ -1,0 +1,3 @@
+-r requirements.txt
+# TestClient needs an HTTP transport; nothing in the app itself uses httpx.
+httpx==0.28.1

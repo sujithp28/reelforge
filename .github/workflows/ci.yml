@@ -24,7 +24,7 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: backend/requirements.txt
+          cache-dependency-path: backend/requirements-dev.txt
 
       # The caption tests need a real TTF, and the render pipeline shells out
       # to ffmpeg, so install both rather than skipping those checks.
@@ -34,13 +34,21 @@ jobs:
           sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core
 
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt
+        run: python -m pip install -r requirements-dev.txt
 
-      - name: Run tests
+      - name: Unit tests (planner and ffmpeg commands)
         run: python test_reelforge.py
+
+      - name: API tests (routes, validation, abstractions)
+        run: python test_api.py
 
       - name: Import the app
         run: python -c "from app.main import app; print(app.title, app.version)"
+
+      # Catches a schema that only works because SQLite skips foreign-key
+      # validation, which is what hid the assets/scenes ordering bug.
+      - name: Schema is ordered for a strict database
+        run: python check_schema_order.py
 
   frontend:
     name: Frontend build
