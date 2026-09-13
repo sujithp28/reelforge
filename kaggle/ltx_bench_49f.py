@@ -32,14 +32,11 @@ def check_prerequisites():
     if not LTX_REPO.exists():
         issues.append(f"LTX-Video repo not found at {LTX_REPO}")
 
-    checkpoint = (
-        KAGGLE_WORKING
-        / "LTX-Video/models/ltxv-2b-0.9.8-distilled.safetensors"
-    )
+    checkpoint = Path("/root/.cache/reelforge-ltx/ltxv-2b-0.9.8-distilled.safetensors")
     if not checkpoint.exists():
         issues.append("Checkpoint not found — run the LTX setup/download step")
 
-    if not (KAGGLE_WORKING / "text_encoder").exists():
+    if not Path("/root/.cache/reelforge-ltx/text_encoder").exists():
         issues.append("Text encoder not found — run the text encoder setup step")
 
     if not CONFIG_PATH.exists():
