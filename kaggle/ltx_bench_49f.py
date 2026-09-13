@@ -128,7 +128,7 @@ def run_benchmark():
 
     cmd = [
         sys.executable,
-        str(LTX_REPO / "ltx_video" / "inference.py"),
+        str(LTX_REPO / "inference.py"),
         "--pipeline_config",
         str(CONFIG_PATH),
         "--prompt",
