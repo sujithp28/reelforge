@@ -148,6 +148,7 @@ class KaggleGenerator:
             with db.connect() as conn:
                 repo.requeue_stale_scene_jobs(
                     conn,
+                    provider=self.name,
                     claim_timeout_seconds=config.KAGGLE_CLAIM_TIMEOUT_SECONDS,
                     max_attempts=config.KAGGLE_MAX_ATTEMPTS,
                 )

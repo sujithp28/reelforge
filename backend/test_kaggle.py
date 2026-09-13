@@ -428,7 +428,7 @@ def test_stale_claimed_job_is_requeued():
             ("2000-01-01 00:00:00", job_id),
         )
         result = repo.requeue_stale_scene_jobs(
-            conn, claim_timeout_seconds=1, max_attempts=5
+            conn, provider="kaggle", claim_timeout_seconds=1, max_attempts=5
         )
     assert result["requeued"] >= 1, result
     with db.connect() as conn:
@@ -450,7 +450,7 @@ def test_stale_job_out_of_attempts_fails_instead_of_looping():
             (repo.JOB_CLAIMED, "2000-01-01 00:00:00", job_id),
         )
         result = repo.requeue_stale_scene_jobs(
-            conn, claim_timeout_seconds=1, max_attempts=3
+            conn, provider="kaggle", claim_timeout_seconds=1, max_attempts=3
         )
     assert result["failed"] >= 1, result
     with db.connect() as conn:

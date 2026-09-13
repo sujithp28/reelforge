@@ -624,7 +624,7 @@ def cancel_scene_jobs_for_scene(conn: Any, scene_id: str) -> int:
     ).rowcount)
 
 
-def requeue_stale_scene_jobs(conn: Any, *, claim_timeout_seconds: int,
+def requeue_stale_scene_jobs(conn: Any, *, provider: str, claim_timeout_seconds: int,
                              max_attempts: int) -> dict[str, int]:
     """Rescue jobs whose worker disappeared.
 
@@ -633,6 +633,13 @@ def requeue_stale_scene_jobs(conn: Any, *, claim_timeout_seconds: int,
     timeout goes back to `pending` so another worker can take it, unless it
     has already used up its attempts, in which case it fails cleanly rather
     than looping on free hardware forever.
+
+    Scoped to one `provider`: different models take wildly different amounts
+    of time per clip (an undistilled model can take 30+ minutes where a
+    distilled one takes under a minute), so a claim timeout tuned for one
+    provider would either wait too long for a truly dead worker on another,
+    or — worse — requeue a still-running job out from under it, causing its
+    eventual upload to be rejected as stale.
     """
     # The cutoff is computed here rather than in SQL: date arithmetic is one
     # of the few things with no portable spelling, and timestamps are stored
@@ -643,10 +650,10 @@ def requeue_stale_scene_jobs(conn: Any, *, claim_timeout_seconds: int,
     ).strftime("%Y-%m-%d %H:%M:%S")
     stale = rows_to_dicts(conn.execute(
         db.sql(
-            "SELECT id, attempts FROM scene_jobs WHERE status = ?"
+            "SELECT id, attempts FROM scene_jobs WHERE status = ? AND provider = ?"
             " AND claimed_at IS NOT NULL AND claimed_at < ?"
         ),
-        (JOB_CLAIMED, cutoff),
+        (JOB_CLAIMED, provider, cutoff),
     ))
     requeued = failed = 0
     for job in stale:

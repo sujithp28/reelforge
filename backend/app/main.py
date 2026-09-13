@@ -38,12 +38,24 @@ db.init()
 with db.connect() as _conn:
     _released = repo.release_stale_renders(_conn)
     # Scene jobs outlive the API process, so a restart must requeue anything a
-    # dead worker left claimed rather than leaving it stuck.
-    _recovered = repo.requeue_stale_scene_jobs(
-        _conn,
-        claim_timeout_seconds=config.KAGGLE_CLAIM_TIMEOUT_SECONDS,
-        max_attempts=config.KAGGLE_MAX_ATTEMPTS,
-    )
+    # dead worker left claimed rather than leaving it stuck. Each Kaggle-hosted
+    # provider gets its own timeout: an undistilled model can legitimately hold
+    # a claim for much longer than a distilled one, so one shared cutoff would
+    # either requeue a still-running job on the slow provider or wait too long
+    # to rescue a truly dead one on the fast provider.
+    _recovered = {"requeued": 0, "failed": 0}
+    for _provider, _timeout in (
+        ("kaggle", config.KAGGLE_CLAIM_TIMEOUT_SECONDS),
+        ("wan", config.WAN_CLAIM_TIMEOUT_SECONDS),
+    ):
+        _result = repo.requeue_stale_scene_jobs(
+            _conn,
+            provider=_provider,
+            claim_timeout_seconds=_timeout,
+            max_attempts=config.KAGGLE_MAX_ATTEMPTS,
+        )
+        _recovered["requeued"] += _result["requeued"]
+        _recovered["failed"] += _result["failed"]
 if _released:
     log.warning("released %d render(s) orphaned by a restart", _released)
 if _recovered["requeued"] or _recovered["failed"]:
@@ -612,11 +624,16 @@ def worker_next_job(
     if provider not in WORKER_PROVIDERS:
         raise HTTPException(422, f"unknown worker provider {provider!r}")
     _require_worker(authorization)
+    claim_timeout = (
+        config.WAN_CLAIM_TIMEOUT_SECONDS if provider == "wan"
+        else config.KAGGLE_CLAIM_TIMEOUT_SECONDS
+    )
     with db.connect() as conn:
         # Rescue anything a dead worker left claimed before handing out work.
         recovered = repo.requeue_stale_scene_jobs(
             conn,
-            claim_timeout_seconds=config.KAGGLE_CLAIM_TIMEOUT_SECONDS,
+            provider=provider,
+            claim_timeout_seconds=claim_timeout,
             max_attempts=config.KAGGLE_MAX_ATTEMPTS,
         )
         if recovered["requeued"] or recovered["failed"]:

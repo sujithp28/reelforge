@@ -112,7 +112,8 @@ class WanGenerator:
             with db.connect() as conn:
                 repo.requeue_stale_scene_jobs(
                     conn,
-                    claim_timeout_seconds=config.KAGGLE_CLAIM_TIMEOUT_SECONDS,
+                    provider=self.name,
+                    claim_timeout_seconds=config.WAN_CLAIM_TIMEOUT_SECONDS,
                     max_attempts=config.KAGGLE_MAX_ATTEMPTS,
                 )
                 job = repo.get_scene_job(conn, job_id)

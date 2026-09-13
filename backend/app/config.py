@@ -104,6 +104,12 @@ WAN_GUIDANCE_SCALE = float(os.environ.get("REELFORGE_WAN_GUIDANCE_SCALE", "5.0")
 # A scene may wait longer than an LTX job before it fails cleanly: Wan's
 # undistilled step count makes even a short clip take minutes, not seconds.
 WAN_JOB_TIMEOUT_SECONDS = int(os.environ.get("REELFORGE_WAN_JOB_TIMEOUT", "2400"))
+# A claimed Wan job whose worker went quiet for this long is requeued.
+# Deliberately much higher than REELFORGE_KAGGLE_CLAIM_TIMEOUT: a verified
+# real generation (5s clip, 30 steps, T4) took ~2124s, so the 600s default
+# tuned for LTX's fast distilled path was requeuing Wan jobs mid-generation
+# and would have made the worker's eventual upload be rejected as stale.
+WAN_CLAIM_TIMEOUT_SECONDS = int(os.environ.get("REELFORGE_WAN_CLAIM_TIMEOUT", "3600"))
 
 QUALITIES = ("standard", "high")
 DEFAULT_QUALITY = os.environ.get("REELFORGE_DEFAULT_QUALITY", "standard").lower()

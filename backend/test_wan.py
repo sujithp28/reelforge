@@ -117,6 +117,98 @@ def test_unknown_worker_provider_is_rejected():
     assert res.status_code == 422
 
 
+# --- claim-timeout regression: a real bug found generating a real clip ------
+#
+# A live 5s/30-step Wan generation on a T4 took ~2124s. The stale-claim sweep
+# used one shared timeout (KAGGLE_CLAIM_TIMEOUT, 600s default, tuned for LTX's
+# much faster distilled path) for every provider, so it requeued the Wan job
+# out from under the still-running worker, and its eventual upload would have
+# been rejected as no longer claimed. Fixed by scoping the sweep to one
+# provider per call, each using its own timeout.
+
+def test_kaggle_sweep_never_touches_a_wan_job():
+    project = make_project()
+    scene_id = first_scene_id(project)
+    with db.connect() as conn:
+        job_id = repo.create_scene_job(
+            conn, project_id=project["id"], scene_id=scene_id, provider="wan",
+            prompt="a", duration=5, width=1080, height=1920, fps=16, quality="standard",
+        )
+        conn.execute(
+            db.sql("UPDATE scene_jobs SET status = ?, claimed_by = ?,"
+                   " claimed_at = ? WHERE id = ?"),
+            (repo.JOB_CLAIMED, "wan-1", "2000-01-01 00:00:00", job_id),
+        )
+        # However short, a sweep scoped to "kaggle" must never touch this
+        # job: it belongs to a different provider's queue lane entirely.
+        repo.requeue_stale_scene_jobs(
+            conn, provider="kaggle", claim_timeout_seconds=1, max_attempts=5,
+        )
+        row = repo.get_scene_job(conn, job_id)
+        # Tests share one job queue; leaving this claimed would let a later
+        # test's poll pick up this ancient job instead of its own.
+        conn.execute(db.sql("UPDATE scene_jobs SET status = ? WHERE id = ?"),
+                     (repo.JOB_CANCELLED, job_id))
+    assert row["status"] == repo.JOB_CLAIMED
+
+
+def test_wan_sweep_uses_wans_own_long_timeout():
+    from datetime import datetime, timedelta, timezone
+
+    project = make_project()
+    scene_id = first_scene_id(project)
+    # Older than the old shared 600s default, but well inside Wan's own
+    # 3600s one: exactly the still-generating job the bug used to requeue.
+    claimed_700s_ago = (
+        datetime.now(timezone.utc) - timedelta(seconds=700)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    with db.connect() as conn:
+        job_id = repo.create_scene_job(
+            conn, project_id=project["id"], scene_id=scene_id, provider="wan",
+            prompt="a", duration=5, width=1080, height=1920, fps=16, quality="standard",
+        )
+        conn.execute(
+            db.sql("UPDATE scene_jobs SET status = ?, claimed_by = ?,"
+                   " claimed_at = ? WHERE id = ?"),
+            (repo.JOB_CLAIMED, "wan-1", claimed_700s_ago, job_id),
+        )
+        repo.requeue_stale_scene_jobs(
+            conn, provider="wan",
+            claim_timeout_seconds=config.WAN_CLAIM_TIMEOUT_SECONDS,
+            max_attempts=5,
+        )
+        row = repo.get_scene_job(conn, job_id)
+        conn.execute(db.sql("UPDATE scene_jobs SET status = ? WHERE id = ?"),
+                     (repo.JOB_CANCELLED, job_id))
+    assert row["status"] == repo.JOB_CLAIMED, (
+        "a still-generating Wan job was requeued before its own timeout elapsed"
+    )
+
+
+def test_wan_sweep_still_rescues_a_genuinely_dead_worker():
+    project = make_project()
+    scene_id = first_scene_id(project)
+    with db.connect() as conn:
+        job_id = repo.create_scene_job(
+            conn, project_id=project["id"], scene_id=scene_id, provider="wan",
+            prompt="a", duration=5, width=1080, height=1920, fps=16, quality="standard",
+        )
+        conn.execute(
+            db.sql("UPDATE scene_jobs SET status = ?, claimed_by = ?,"
+                   " claimed_at = ? WHERE id = ?"),
+            (repo.JOB_CLAIMED, "wan-1", "2000-01-01 00:00:00", job_id),
+        )
+        result = repo.requeue_stale_scene_jobs(
+            conn, provider="wan", claim_timeout_seconds=1, max_attempts=5,
+        )
+        row = repo.get_scene_job(conn, job_id)
+        conn.execute(db.sql("UPDATE scene_jobs SET status = ? WHERE id = ?"),
+                     (repo.JOB_CANCELLED, job_id))
+    assert result["requeued"] >= 1
+    assert row["status"] == repo.JOB_PENDING
+    assert row["claimed_by"] is None and row["claimed_at"] is None
+
+
 # --- end-to-end dry-run round trip -------------------------------------------
 
 def test_dry_run_round_trip_normalises_the_worker_clip():
