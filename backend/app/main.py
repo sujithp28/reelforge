@@ -590,16 +590,27 @@ def _worker_job_view(job: dict) -> dict:
     }
 
 
+# Kaggle-hosted GPU workers share one worker API and one auth token; only the
+# queue lane they claim from differs, via this allow-list.
+WORKER_PROVIDERS = ("kaggle", "wan")
+
+
 @app.get("/api/worker/kaggle/jobs/next")
 def worker_next_job(
     authorization: str | None = Header(default=None),
     worker_id: str = Query(default="kaggle", max_length=64),
+    provider: str = Query(default="kaggle"),
 ):
     """Claim the oldest pending scene job, or report that there is none.
 
     Claiming is atomic in the repository layer, so two workers polling
-    simultaneously cannot be handed the same scene.
+    simultaneously cannot be handed the same scene. `provider` selects which
+    queue lane to claim from ("kaggle" for LTX-Video, "wan" for Wan 2.1);
+    the route path stays "kaggle" for backward compatibility since it names
+    the shared worker infrastructure, not any one model.
     """
+    if provider not in WORKER_PROVIDERS:
+        raise HTTPException(422, f"unknown worker provider {provider!r}")
     _require_worker(authorization)
     with db.connect() as conn:
         # Rescue anything a dead worker left claimed before handing out work.
@@ -611,7 +622,7 @@ def worker_next_job(
         if recovered["requeued"] or recovered["failed"]:
             log.info("stale scene jobs: %s", recovered)
         job = repo.claim_next_scene_job(
-            conn, provider="kaggle", worker_id=worker_id[:64]
+            conn, provider=provider, worker_id=worker_id[:64]
         )
     if job is None:
         return {"job": None}

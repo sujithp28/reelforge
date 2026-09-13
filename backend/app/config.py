@@ -81,6 +81,30 @@ KAGGLE_MAX_CLIP_BYTES = int(
     os.environ.get("REELFORGE_KAGGLE_MAX_CLIP_BYTES", 200 * 1024 * 1024)
 )
 
+# --- Wan 2.1 GPU beta worker -------------------------------------------------
+# Same Kaggle-hosted-worker mechanism as the "kaggle" (LTX) provider above,
+# reusing REELFORGE_KAGGLE_WORKER_TOKEN for auth since it is one shared secret
+# for the Kaggle GPU worker API, not tied to any one model. "wan" is a
+# separate provider only because it is a different model and queue lane.
+#
+# Model id on the Hugging Face Hub. The default is the diffusers-format
+# checkpoint, loaded through diffusers.WanPipeline rather than the original
+# Wan-Video/Wan2.1 repo: diffusers exposes dtype as a normal constructor
+# argument, so a Tesla T4 (Turing, no bf16 support) can run this in fp16
+# without patching vendored inference code.
+WAN_MODEL_ID = os.environ.get("REELFORGE_WAN_MODEL_ID", "Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
+# Generation geometry and step count. Wan2.1 1.3B has no step-distilled
+# checkpoint, so this is meaningfully slower per clip than the LTX path.
+WAN_GEN_WIDTH = int(os.environ.get("REELFORGE_WAN_GEN_WIDTH", "832"))
+WAN_GEN_HEIGHT = int(os.environ.get("REELFORGE_WAN_GEN_HEIGHT", "480"))
+WAN_GEN_FPS = int(os.environ.get("REELFORGE_WAN_GEN_FPS", "16"))
+WAN_STEPS_STANDARD = int(os.environ.get("REELFORGE_WAN_STEPS_STANDARD", "30"))
+WAN_STEPS_HIGH = int(os.environ.get("REELFORGE_WAN_STEPS_HIGH", "40"))
+WAN_GUIDANCE_SCALE = float(os.environ.get("REELFORGE_WAN_GUIDANCE_SCALE", "5.0"))
+# A scene may wait longer than an LTX job before it fails cleanly: Wan's
+# undistilled step count makes even a short clip take minutes, not seconds.
+WAN_JOB_TIMEOUT_SECONDS = int(os.environ.get("REELFORGE_WAN_JOB_TIMEOUT", "2400"))
+
 QUALITIES = ("standard", "high")
 DEFAULT_QUALITY = os.environ.get("REELFORGE_DEFAULT_QUALITY", "standard").lower()
 

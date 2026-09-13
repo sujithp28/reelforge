@@ -1,7 +1,17 @@
 # ReelForge Kaggle GPU beta worker
 
-Free GPU generation for the ReelForge beta, using open-source LTX-Video on a
-Kaggle T4 session.
+Free GPU generation for the ReelForge beta, using open-source models on a
+Kaggle T4 session. Two workers exist:
+
+- `wan_worker.py` — Wan 2.1 1.3B, the intended beta provider (`wan`).
+  Documented in [Setup: Wan 2.1](#setup-wan-21-the-intended-beta-provider)
+  below.
+- `reelforge_worker.py` — LTX-Video (`kaggle` provider), kept for now; see
+  [Setup: LTX-Video](#setup-ltx-video) further down.
+
+Both share the same worker API, auth token and queue mechanism (see below);
+only the model and the queue lane (`provider=wan` vs `provider=kaggle`)
+differ.
 
 Kaggle is for development and beta generation. It is **not** long-term
 production GPU infrastructure: sessions are time-limited, can be killed
@@ -85,10 +95,54 @@ landscape frame. Frame counts are snapped up to LTX's 8k+1 requirement and
 the backend trims to the exact customer duration. There is **no 6-second
 floor** here: unlike the hosted API, a 2-second scene generates ~2 seconds.
 
-## Setup on Kaggle
+## Setup: Wan 2.1 (the intended beta provider)
 
 Create a notebook, set the accelerator to **GPU T4 x2**, enable internet, and
 add your worker token as a Kaggle Secret rather than typing it in a cell.
+No custom repo clone or build step is needed — `diffusers` pulls the model
+straight from the Hugging Face Hub.
+
+```python
+# Cell 1 - dependencies. transformers is pinned EXACTLY, not >=: an unpinned
+# floor resolved to 5.0.0 on a real run and silently reinitialised the text
+# encoder's embed_tokens.weight at random instead of loading it (missing
+# from the checkpoint per transformers' own load report). No flash_attn: a
+# T4 (Turing, cc 7.5) cannot build or run it, and diffusers falls back to
+# plain PyTorch SDPA attention anyway.
+!pip -q install "diffusers==0.37.1" "transformers==4.49.0" accelerate ftfy imageio imageio-ffmpeg
+
+# Cell 2 - the worker (from your repo, or uploaded as a dataset)
+!git clone https://github.com/sujithp28/reelforge.git /kaggle/working/reelforge
+
+# Cell 3 - configuration. Read the token from Kaggle Secrets, never inline.
+import os
+from kaggle_secrets import UserSecretsClient
+os.environ["REELFORGE_API_BASE"] = "https://your-public-url"
+os.environ["REELFORGE_WORKER_TOKEN"] = UserSecretsClient().get_secret("REELFORGE_WORKER_TOKEN")
+os.environ["REELFORGE_CUDA_DEVICE"] = "0"
+
+# Cell 4 - confirm the model actually runs on this session before touching
+# the queue at all. Writes ./wan_self_test.mp4 and exits.
+!python /kaggle/working/reelforge/kaggle/wan_worker.py --self-test
+
+# Cell 5 - run the real worker
+!python /kaggle/working/reelforge/kaggle/wan_worker.py
+```
+
+Set `REELFORGE_VIDEO_PROVIDER=wan` in the backend's `.env` to route renders
+here. `REELFORGE_KAGGLE_WORKER_TOKEN` is the same shared secret as the
+Kaggle Secret above — one worker API, one token, regardless of which model
+is running on the other end.
+
+Verified on a real Kaggle T4 (Sep 2026): one 3.5s 480p clip at 30 steps
+took ~18 minutes end to end. Wan2.1 1.3B has no step-distilled checkpoint,
+so this is materially slower than the LTX path — a real hardware limit, not
+a bug.
+
+## Setup: LTX-Video
+
+The original beta provider (`kaggle`), kept for now. Same accelerator and
+worker-token setup as above.
 
 ```python
 # Cell 1 - dependencies and the model repo
@@ -135,6 +189,7 @@ be exercised locally with no GPU, no weights and no downloads:
 
 ```bash
 REELFORGE_API_BASE=http://localhost:8000 REELFORGE_WORKER_TOKEN=dev-token python kaggle/reelforge_worker.py --dry-run --max-jobs 5
+REELFORGE_API_BASE=http://localhost:8000 REELFORGE_WORKER_TOKEN=dev-token python kaggle/wan_worker.py --dry-run --max-jobs 5
 ```
 
 It deliberately produces the wrong frame rate and a slightly wrong length, to

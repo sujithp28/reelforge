@@ -10,8 +10,11 @@ not care which provider produced the clips — that is the point of the seam.
   ltx   real AI generation through the LTX hosted API. Implemented in ltx.py;
         reports itself unavailable until an endpoint and key are configured.
         Paid, and kept available as an option.
-  kaggle real AI generation on a free Kaggle GPU. Implemented in kaggle.py:
-        the backend queues scene jobs and an external worker drains them.
+  kaggle real AI generation on a free Kaggle GPU via LTX-Video. Implemented
+        in kaggle.py: the backend queues scene jobs and an external worker
+        drains them.
+  wan   real AI generation on a free Kaggle GPU via Wan 2.1 1.3B. Implemented
+        in wan.py, same queue mechanism as "kaggle" with its own queue lane.
         The intended provider for the beta.
 
 Providers must honour the requested duration and resolution exactly. render.py
@@ -109,13 +112,21 @@ def build_generator(name: str | None = None) -> VideoGenerator:
             job_timeout=config.KAGGLE_JOB_TIMEOUT_SECONDS,
             poll_seconds=config.KAGGLE_POLL_SECONDS,
         )
+    if chosen == "wan":
+        from .wan import WanGenerator
+
+        return WanGenerator(
+            worker_token=config.KAGGLE_WORKER_TOKEN,
+            job_timeout=config.WAN_JOB_TIMEOUT_SECONDS,
+            poll_seconds=config.KAGGLE_POLL_SECONDS,
+        )
     raise RenderError(
         f"unknown video provider {chosen!r};"
         f" expected one of: {', '.join(PROVIDER_NAMES)}"
     )
 
 
-PROVIDER_NAMES = ("mock", "ltx", "kaggle")
+PROVIDER_NAMES = ("mock", "ltx", "kaggle", "wan")
 
 
 def available_providers() -> dict[str, bool]:
