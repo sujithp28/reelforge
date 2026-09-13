@@ -6,8 +6,8 @@
 #   - pipeline_type omitted → single-pass LTXVideoPipeline (no spatial upscaler)
 #   - spatial_upscaler_model_path omitted → no upscaler download/load
 
-checkpoint_path: "/kaggle/working/LTX-Video/models/ltxv-2b-0.9.8-distilled.safetensors"
-text_encoder_model_name_or_path: "/kaggle/working/text_encoder"
+checkpoint_path: "/root/.cache/reelforge-ltx/ltxv-2b-0.9.8-distilled.safetensors"
+text_encoder_model_name_or_path: "/root/.cache/reelforge-ltx/text_encoder"
 precision: "bfloat16"
 sampler: "from_checkpoint"
 stg_mode: "attention_values"
