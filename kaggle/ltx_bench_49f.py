@@ -10,13 +10,16 @@ Run from /kaggle/working:
 
 import sys
 import time
+import threading
 import subprocess
 from pathlib import Path
 
 KAGGLE_WORKING = Path("/kaggle/working")
 LTX_REPO = KAGGLE_WORKING / "LTX-Video"
 CONFIG_PATH = Path(__file__).parent / "configs" / "bench-t4-49f-noupscaler.yaml"
-OUTPUT_PATH = KAGGLE_WORKING / "bench_49f_output.mp4"
+# LTX treats --output_path as a directory and picks its own filename inside it.
+OUTPUT_DIR = KAGGLE_WORKING / "ltx_bench_49f_output"
+VRAM_POLL_SECONDS = 0.5
 
 PROMPT = (
     "A camera slowly pans across a sunlit forest path, "
@@ -74,14 +77,42 @@ def gpu_info():
         sys.exit(1)
 
 
-def peak_vram_gb():
+def gpu0_used_mib():
+    """GPU 0 memory in use across all processes, via nvidia-smi. None if unavailable."""
     try:
-        import torch
-
-        return torch.cuda.max_memory_allocated() / 1024**3
-
-    except Exception:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+                "-i",
+                "0",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        return int(result.stdout.strip().splitlines()[0])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         return None
+
+
+def poll_gpu0_memory(stop, samples):
+    while not stop.is_set():
+        used = gpu0_used_mib()
+        if used is not None:
+            samples.append(used)
+        stop.wait(VRAM_POLL_SECONDS)
+
+
+def find_output_video(since):
+    """Newest .mp4 in OUTPUT_DIR written during this run, so older runs are never reported."""
+    if not OUTPUT_DIR.is_dir():
+        return None
+    videos = [p for p in OUTPUT_DIR.glob("*.mp4") if p.stat().st_mtime >= since]
+    return max(videos, key=lambda p: p.stat().st_mtime, default=None)
 
 
 def probe_video(path):
@@ -144,7 +175,7 @@ def run_benchmark():
         "--seed",
         str(SEED),
         "--output_path",
-        str(OUTPUT_PATH),
+        str(OUTPUT_DIR),
         "--offload_to_cpu",
         "True",
     ]
@@ -158,15 +189,28 @@ def run_benchmark():
     )
     print("=" * 60)
 
+    baseline_mib = gpu0_used_mib()
+    vram_samples = []
+    stop_polling = threading.Event()
+    poller = threading.Thread(
+        target=poll_gpu0_memory, args=(stop_polling, vram_samples), daemon=True
+    )
+
+    run_started_at = time.time()
     start = time.perf_counter()
 
     print(f"[{time.strftime('%H:%M:%S')}] Starting inference...")
 
-    result = subprocess.run(
-        cmd,
-        cwd=str(KAGGLE_WORKING),
-        text=True,
-    )
+    poller.start()
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(KAGGLE_WORKING),
+            text=True,
+        )
+    finally:
+        stop_polling.set()
+        poller.join()
 
     total_time = time.perf_counter() - start
 
@@ -174,23 +218,38 @@ def run_benchmark():
     print("RESULTS")
     print("=" * 60)
 
+    if vram_samples:
+        peak_mib = max(vram_samples)
+        baseline_text = (
+            f"{baseline_mib / 1024:.2f} GB" if baseline_mib is not None else "N/A"
+        )
+        print(
+            f"Peak VRAM:     {peak_mib / 1024:.2f} GB "
+            f"(GPU 0, nvidia-smi, {len(vram_samples)} samples; "
+            f"baseline before inference: {baseline_text})"
+        )
+    else:
+        print("Peak VRAM:     N/A (nvidia-smi unavailable)")
+
     if result.returncode != 0:
         print(f"✗ inference.py failed (exit {result.returncode})")
         return
 
-    vram = peak_vram_gb()
+    video_path = find_output_video(run_started_at)
 
-    if OUTPUT_PATH.exists():
-        duration, width, height, fps = probe_video(OUTPUT_PATH)
-        size_mb = OUTPUT_PATH.stat().st_size / 1024**2
+    if video_path is not None:
+        duration, width, height, fps = probe_video(video_path)
+        size_mb = video_path.stat().st_size / 1024**2
     else:
         duration, width, height, fps = None, None, None, None
         size_mb = None
 
     print(f"Total time:    {total_time:.1f}s ({total_time / 60:.2f} min)")
 
-    if vram is not None:
-        print(f"Peak VRAM:     {vram:.2f} GB")
+    if video_path is not None:
+        print(f"Output file:   {video_path}")
+    else:
+        print(f"Output file:   not found — no new .mp4 in {OUTPUT_DIR}")
 
     if size_mb is not None:
         print(f"File size:     {size_mb:.1f} MB")
