@@ -154,9 +154,10 @@ class LTXRunner:
     Loads the model once in `warm_up()` and keeps it resident in
     `self.pipeline` for the life of the worker process - unlike shelling out
     to the official repo's `inference.py`, which reloads weights on every
-    scene. Applies `enable_model_cpu_offload()`, attention slicing, and VAE
-    tiling/slicing, the standard diffusers techniques for fitting this model
-    family in a T4's 16 GB.
+    scene. Loading goes through `_local_runner.load_pipeline`, shared with
+    every other local-model worker: fp16, CPU offload, attention slicing,
+    VAE tiling/slicing - the standard diffusers techniques for fitting this
+    model family in a T4's 16 GB.
 
     reference_image (image-to-video) is accepted from the job but not yet
     used here - text-to-video only, the same documented gap as the Wan
@@ -173,28 +174,10 @@ class LTXRunner:
 
     def warm_up(self) -> None:
         """Load the model once and keep it resident on the GPU."""
-        import torch
-        from diffusers import LTXConditionPipeline
+        from _local_runner import load_pipeline
 
-        # A T4 is Turing (sm_75) and has no bfloat16 support, so fp16 is used
-        # even though the diffusers example for this checkpoint uses bf16.
-        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-
-        log.info("loading %s (dtype=%s)...", self.describe(), dtype)
-        pipeline = LTXConditionPipeline.from_pretrained(self.model_id, torch_dtype=dtype)
-        if torch.cuda.is_available():
-            pipeline.enable_model_cpu_offload(device=f"cuda:{self.device}")
-        else:
-            pipeline = pipeline.to("cpu")
-        if hasattr(pipeline, "enable_attention_slicing"):
-            pipeline.enable_attention_slicing()
-        vae = getattr(pipeline, "vae", None)
-        if vae is not None:
-            if hasattr(vae, "enable_tiling"):
-                vae.enable_tiling()
-            if hasattr(vae, "enable_slicing"):
-                vae.enable_slicing()
-        self.pipeline = pipeline
+        log.info("loading %s...", self.describe())
+        self.pipeline = load_pipeline("LTXConditionPipeline", self.model_id, self.device)
         log.info("%s ready", self.describe())
 
     def generate(self, request: GenerationRequest, out: Path) -> None:

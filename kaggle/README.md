@@ -11,7 +11,11 @@ Kaggle T4 session. Two workers exist:
 
 Both share the same worker API, auth token and queue mechanism (see below);
 only the model and the queue lane (`provider=wan` vs `provider=kaggle`)
-differ.
+differ. They also share `_local_runner.py` for loading the diffusers
+pipeline itself - fp16, CPU offload, attention slicing, VAE tiling/slicing,
+plus any per-model dtype fixups - so a memory-fit fix found for one model
+(or a third local model added later) doesn't have to be rediscovered per
+worker.
 
 Kaggle is for development and beta generation. It is **not** long-term
 production GPU infrastructure: sessions are time-limited, can be killed

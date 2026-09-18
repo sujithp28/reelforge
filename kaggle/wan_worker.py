@@ -153,10 +153,12 @@ class GenerationRequest:
 class WanRunner:
     """Runs Wan 2.1 1.3B in-process through Hugging Face diffusers.
 
-    The pipeline is loaded once in `warm_up` and reused for every job, in
-    fp16 (the VAE stays fp32) because a T4 has no bf16 hardware support.
-    `enable_model_cpu_offload()` is diffusers' own tested memory
-    optimisation, not something reimplemented here.
+    Loading goes through `_local_runner.load_pipeline`, shared with every
+    other local-model worker: fp16, CPU offload, attention slicing, VAE
+    tiling/slicing. `dtype_fixups` carries this model's one hardware-verified
+    quirk - `torch_dtype=` at load time does not reliably reach the
+    transformer submodule, confirmed on a real Kaggle T4 - forward so a new
+    local model doesn't have to rediscover it.
     """
 
     def __init__(self, model_id: str, device: str = "0"):
@@ -169,18 +171,15 @@ class WanRunner:
 
     def warm_up(self) -> None:
         import torch
-        from diffusers import WanPipeline
+        from _local_runner import load_pipeline
 
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", self.device)
         torch.cuda.set_device(0)
-        log.info("loading %s in fp16 (this can take a few minutes)", self.describe())
-        pipeline = WanPipeline.from_pretrained(self.model_id, torch_dtype=torch.float16)
-        pipeline.vae.to(torch.float32)
-        # torch_dtype above does not reliably reach every submodule; verified
-        # on hardware that the transformer needs this explicit cast too.
-        pipeline.transformer.to(torch.float16)
-        pipeline.enable_model_cpu_offload(device="cuda:0")
-        self._pipeline = pipeline
+        log.info("loading %s (this can take a few minutes)", self.describe())
+        self._pipeline = load_pipeline(
+            "WanPipeline", self.model_id, self.device,
+            dtype_fixups={"vae": torch.float32, "transformer": torch.float16},
+        )
         log.info("%s ready on cuda:0", self.describe())
 
     def generate(self, request: GenerationRequest, out: Path) -> None:
