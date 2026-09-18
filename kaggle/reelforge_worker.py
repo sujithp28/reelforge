@@ -380,11 +380,41 @@ def run_forever(client: ReelForgeClient, runner, max_jobs: int | None = None,
     return done
 
 
+def self_test(runner) -> int:
+    """Generate one tiny clip locally, no ReelForge API involved.
+
+    The fastest way to confirm the model actually runs - and actually fits
+    in a T4's VRAM - on a given Kaggle session before wiring it to the queue.
+    """
+    out = Path("ltx_self_test.mp4")
+    runner.warm_up()
+    started = time.monotonic()
+    runner.generate(
+        GenerationRequest(
+            prompt="a small red boat floating on a calm lake at sunrise",
+            seconds=2.0, width=832, height=480, quality="standard",
+        ),
+        out,
+    )
+    elapsed = time.monotonic() - started
+    if not out.exists() or out.stat().st_size == 0:
+        log.error("self-test produced no output file")
+        return 1
+    log.info("self-test clip written to %s in %.0fs (%d KB)",
+              out, elapsed, out.stat().st_size // 1024)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="ReelForge Kaggle GPU worker")
     parser.add_argument(
         "--dry-run", action="store_true",
         help="generate synthetic clips with ffmpeg instead of loading a model",
+    )
+    parser.add_argument(
+        "--self-test", action="store_true",
+        help="generate one tiny clip to ./ltx_self_test.mp4 and exit;"
+             " no ReelForge API required",
     )
     parser.add_argument(
         "--max-jobs", type=int, default=None,
@@ -402,6 +432,8 @@ def main(argv: list[str] | None = None) -> int:
         model_id=LTX_MODEL_ID,
         device=CUDA_DEVICE,
     )
+    if args.self_test:
+        return self_test(runner)
     try:
         client = ReelForgeClient(API_BASE, WORKER_TOKEN, WORKER_ID)
     except RuntimeError as exc:
