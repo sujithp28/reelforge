@@ -177,7 +177,15 @@ class LTXRunner:
         from _local_runner import load_pipeline
 
         log.info("loading %s...", self.describe())
-        self.pipeline = load_pipeline("LTXConditionPipeline", self.model_id, self.device)
+        # device_map="balanced": this checkpoint is fp32-only on disk (no
+        # fp16 variant), and converting it to fp16 in host RAM during a
+        # plain from_pretrained() OOMs a low-RAM session (verified on a
+        # Kaggle T4x2 session: 31GB RAM, 0 swap). Spreading the load across
+        # both T4s' combined 32GB VRAM instead sidesteps host RAM for this
+        # step entirely - see kaggle/README.md "Known limitations".
+        self.pipeline = load_pipeline(
+            "LTXConditionPipeline", self.model_id, self.device, device_map="balanced",
+        )
         log.info("%s ready", self.describe())
 
     def generate(self, request: GenerationRequest, out: Path) -> None:

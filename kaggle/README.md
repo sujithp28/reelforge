@@ -243,16 +243,26 @@ Backend side: see `.env.example` for `REELFORGE_KAGGLE_*`.
 
 ## Known limitations
 
-- **The GPU path is unverified.** There is no GPU in the development
-  environment. A prior CLI-based `LTXRunner` (shelling out to the official
-  LTX-Video repo's `inference.py`) was tested on a real Kaggle T4 and
-  reliably hit `torch.OutOfMemoryError` loading the 2B distilled checkpoint +
-  text encoder alone (14.56 GiB total, both with and without the spatial
-  upscaler) - this in-process diffusers rewrite is meant to fix that with
-  `enable_model_cpu_offload()` plus attention/VAE slicing and tiling, but
-  has not itself been run against real weights yet. Everything else,
-  including the full queue, upload, normalisation and retry flow, is
-  verified with the `--dry-run` runner.
+- **The LTX checkpoint is fp32-only on Hugging Face (no fp16 variant),
+  47.6 GiB total (19 GiB text encoder + 26 GiB transformer + 2.5 GiB VAE).**
+  On a real Kaggle T4x2 session (31 GiB system RAM, 0 swap), loading it with
+  a plain `from_pretrained(torch_dtype=torch.float16)` OOM-restarted the
+  notebook's *host RAM* partway through loading the transformer's shards -
+  the GPUs sat at 0% the whole time. This is separate from GPU VRAM: every
+  shard is read into host RAM and cast to fp16 before reaching the GPU, so a
+  47.6 GiB-on-disk checkpoint has to pass through the RAM ceiling regardless
+  of GPU headroom. `low_cpu_mem_usage=True` (shard-by-shard loading instead
+  of the whole state dict at once) measurably delayed the crash but did not
+  prevent it. The fix verified next: `device_map="balanced"`, which has
+  accelerate stream each shard from its mmap'd safetensors file straight to
+  a GPU instead of fully materialising it in host RAM first - spreading the
+  ~23 GiB fp16 footprint across both T4s' combined 32 GiB VRAM rather than
+  through the 31 GiB host RAM. `enable_model_cpu_offload()` plus attention
+  slicing and VAE tiling/slicing remain the earlier, still-relevant VRAM-side
+  fixes, used only when `device_map` isn't. Not yet re-verified against real
+  weights past this change. Everything else, including the full queue,
+  upload, normalisation and retry flow, is verified with the `--dry-run`
+  runner.
 - Standard and High both use the same distilled checkpoint in beta, and
   differ only in step count. The UI does not claim otherwise.
 - No visual consistency guarantees between scenes.

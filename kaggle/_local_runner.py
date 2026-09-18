@@ -27,6 +27,7 @@ def load_pipeline(
     model_id: str,
     device: str = "0",
     dtype_fixups: dict[str, "object"] | None = None,
+    device_map: str | None = None,
 ):
     """Load `pipeline_class` from `model_id` with T4-safe memory settings.
 
@@ -38,11 +39,27 @@ def load_pipeline(
             `from_pretrained`, for submodules the top-level `torch_dtype`
             does not reliably reach. Dotted paths are supported
             (e.g. {"vae": torch.float32, "transformer": torch.float16}).
+            Not compatible with `device_map` (accelerate hooks a dispatched
+            module's `.to()`, so a manual cast after load would corrupt it).
+        device_map: e.g. "balanced" to have accelerate stream each shard
+            straight from its mmap'd safetensors file to its target GPU
+            during `from_pretrained`, instead of fully materialising the
+            checkpoint in host RAM first. For a checkpoint with no fp16
+            variant (fp32-only on disk), this is the difference between
+            fitting a low-RAM session and OOM-ing partway through loading,
+            since converting fp32->fp16 for the whole model in host RAM is
+            what `low_cpu_mem_usage=True` alone still doesn't avoid. Spreads
+            across both T4s rather than offloading to CPU, so it needs the
+            checkpoint's fp16 footprint to fit in combined GPU VRAM instead
+            of in system RAM.
 
     Returns the loaded pipeline, offloaded/sliced/tiled and ready to call.
     """
     import torch
     import diffusers
+
+    if device_map and dtype_fixups:
+        raise ValueError("device_map and dtype_fixups cannot be combined")
 
     cls = getattr(diffusers, pipeline_class)
     has_cuda = torch.cuda.is_available()
@@ -50,13 +67,18 @@ def load_pipeline(
     # though most upstream examples for these models show bf16.
     dtype = torch.float16 if has_cuda else torch.float32
 
-    log.info("loading %s from %s (dtype=%s)...", pipeline_class, model_id, dtype)
-    # Explicit rather than relying on diffusers' default: for an fp32-only
-    # checkpoint (no fp16 variant to download instead), this is what keeps
-    # shard loading from materialising the full fp32 state dict in host RAM
-    # before casting - the difference between fitting a low-RAM session and
-    # not, independent of the GPU-side offload/slicing below.
-    pipeline = cls.from_pretrained(model_id, torch_dtype=dtype, low_cpu_mem_usage=True)
+    log.info("loading %s from %s (dtype=%s, device_map=%s)...",
+              pipeline_class, model_id, dtype, device_map)
+    # low_cpu_mem_usage=True is explicit rather than relying on diffusers'
+    # default: for an fp32-only checkpoint (no fp16 variant to download
+    # instead), this is what keeps shard loading from materialising the full
+    # fp32 state dict in host RAM before casting. It's not always enough on
+    # its own (a big enough model still peaks over a low-RAM session's
+    # ceiling), which is what device_map is for.
+    kwargs = {"torch_dtype": dtype, "low_cpu_mem_usage": True}
+    if device_map and has_cuda:
+        kwargs["device_map"] = device_map
+    pipeline = cls.from_pretrained(model_id, **kwargs)
 
     for attr_path, cast_dtype in (dtype_fixups or {}).items():
         obj = pipeline
@@ -65,7 +87,9 @@ def load_pipeline(
             obj = getattr(obj, part)
         setattr(obj, leaf, getattr(obj, leaf).to(cast_dtype))
 
-    if has_cuda:
+    if device_map and has_cuda:
+        pass  # already placed on its target device(s) by accelerate
+    elif has_cuda:
         pipeline.enable_model_cpu_offload(device=f"cuda:{device}")
     else:
         pipeline = pipeline.to("cpu")
