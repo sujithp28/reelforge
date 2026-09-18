@@ -51,7 +51,12 @@ def load_pipeline(
     dtype = torch.float16 if has_cuda else torch.float32
 
     log.info("loading %s from %s (dtype=%s)...", pipeline_class, model_id, dtype)
-    pipeline = cls.from_pretrained(model_id, torch_dtype=dtype)
+    # Explicit rather than relying on diffusers' default: for an fp32-only
+    # checkpoint (no fp16 variant to download instead), this is what keeps
+    # shard loading from materialising the full fp32 state dict in host RAM
+    # before casting - the difference between fitting a low-RAM session and
+    # not, independent of the GPU-side offload/slicing below.
+    pipeline = cls.from_pretrained(model_id, torch_dtype=dtype, low_cpu_mem_usage=True)
 
     for attr_path, cast_dtype in (dtype_fixups or {}).items():
         obj = pipeline
