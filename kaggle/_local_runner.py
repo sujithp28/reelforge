@@ -60,6 +60,8 @@ def load_pipeline(
 
     Returns the loaded pipeline, offloaded/sliced/tiled and ready to call.
     """
+    import importlib
+
     import torch
     import diffusers
 
@@ -80,10 +82,31 @@ def load_pipeline(
     # fp32 state dict in host RAM before casting. It's not always enough on
     # its own (a big enough model still peaks over a low-RAM session's
     # ceiling), which is what device_map is for.
-    kwargs = {"torch_dtype": dtype, "low_cpu_mem_usage": True}
-    if device_map and has_cuda:
-        kwargs["device_map"] = device_map
-    pipeline = cls.from_pretrained(model_id, **kwargs)
+    if isinstance(device_map, dict) and has_cuda:
+        # DiffusionPipeline.from_pretrained() only accepts device_map as a
+        # string ("balanced" etc) - it has no notion of "pin this named
+        # component to this device". To get that, load each named component
+        # with its own model class and single-device placement, then hand
+        # the assembled objects to from_pretrained(), which uses whatever
+        # components it's given and only loads the rest (tokenizer,
+        # scheduler) itself.
+        config = cls.load_config(model_id)
+        components = {}
+        for name, target_device in device_map.items():
+            library_name, class_name = config[name]
+            component_cls = getattr(importlib.import_module(library_name), class_name)
+            components[name] = component_cls.from_pretrained(
+                model_id, subfolder=name, torch_dtype=dtype,
+                low_cpu_mem_usage=True, device_map=f"cuda:{target_device}",
+            )
+        pipeline = cls.from_pretrained(
+            model_id, torch_dtype=dtype, low_cpu_mem_usage=True, **components,
+        )
+    else:
+        kwargs = {"torch_dtype": dtype, "low_cpu_mem_usage": True}
+        if device_map and has_cuda:
+            kwargs["device_map"] = device_map
+        pipeline = cls.from_pretrained(model_id, **kwargs)
 
     for attr_path, cast_dtype in (dtype_fixups or {}).items():
         obj = pipeline
