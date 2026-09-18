@@ -1,4 +1,4 @@
-﻿"""ReelForge GPU worker for Kaggle.
+"""ReelForge GPU worker for Kaggle.
 
 Runs on a Kaggle T4 session, polls ReelForge for scene jobs, generates each
 one with open-source LTX-Video, and uploads the result back.
@@ -9,16 +9,27 @@ one with open-source LTX-Video, and uploads the result back.
 
 Design notes:
 
-  * The model is loaded once, before the polling loop. Reloading per scene
+  * The model is loaded once, before the polling loop, and kept resident in
+    `LTXRunner.pipeline` for the life of the process. Reloading per scene
     would dominate the runtime.
-  * Generation runs through `LTXRunner`, which shells out to the official
-    LTX-Video repository's `inference.py` with a `--pipeline_config` YAML.
-    That is the documented way to run the 2B distilled checkpoint, and it
-    keeps us off the project's internal Python API.
+  * Generation runs in-process through diffusers' `LTXConditionPipeline`
+    (`Lightricks/LTX-Video-0.9.7-distilled`), not by shelling out to the
+    official LTX-Video repository's `inference.py` CLI. The CLI path (both
+    its default multi-scale/upscaler config and a no-upscaler single-pass
+    variant) reliably hit `torch.OutOfMemoryError` loading the 2B distilled
+    checkpoint + text encoder alone on a real Kaggle T4 (14.56 GiB) - see
+    "Known limitations" in kaggle/README.md for the exact errors. This
+    in-process path applies `enable_model_cpu_offload()`, attention slicing,
+    and VAE tiling/slicing, the standard diffusers techniques for fitting
+    this model family in a T4's VRAM.
   * `--dry-run` swaps in a runner that writes a short synthetic clip with
     ffmpeg, so the whole loop can be exercised with no GPU and no weights.
   * Model, resolution and step counts are configuration, not constants
     scattered through the file.
+
+UNVERIFIED: this runner was written without access to a GPU and has not been
+run end-to-end on a real Kaggle T4. Confirm it works (`--max-jobs 1` against
+a real job) before relying on it for a production render.
 
 Hardware reality on a Kaggle T4:
   * 16 GB VRAM per GPU, so the 2B distilled checkpoint (~6.3 GB) is the right
@@ -37,7 +48,6 @@ import os
 import random
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 import urllib.error
@@ -54,15 +64,16 @@ API_BASE = os.environ.get("REELFORGE_API_BASE", "").rstrip("/")
 WORKER_TOKEN = os.environ.get("REELFORGE_WORKER_TOKEN", "")
 WORKER_ID = os.environ.get("REELFORGE_WORKER_ID", "kaggle-1")
 
-# Model selection is configuration. The 2B distilled checkpoint is the
-# default because it fits a T4 with room to spare.
-LTX_REPO_DIR = os.environ.get("REELFORGE_LTX_REPO_DIR", "/kaggle/working/LTX-Video")
-_DEFAULT_CONFIG = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "configs", "reelforge-t4-distilled.yaml",
-)
-LTX_PIPELINE_CONFIG = os.environ.get("REELFORGE_LTX_PIPELINE_CONFIG", _DEFAULT_CONFIG)
+# Model selection is configuration. The 2B-class distilled checkpoint is the
+# default because it is the one diffusers ships as a ready-to-load repo
+# (LTXConditionPipeline.from_pretrained) rather than a raw .safetensors file
+# that needs the official repo's custom config/loader.
+LTX_MODEL_ID = os.environ.get("REELFORGE_LTX_MODEL_ID", "Lightricks/LTX-Video-0.9.7-distilled")
 CUDA_DEVICE = os.environ.get("REELFORGE_CUDA_DEVICE", "0")
+
+# Distilled checkpoints are guidance-distilled: they want guidance_scale 1.0,
+# not the 3+ a base checkpoint needs.
+GUIDANCE_SCALE = float(os.environ.get("REELFORGE_LTX_GUIDANCE_SCALE", "1.0"))
 
 # Generation geometry. Deliberately below the customer's final frame: the
 # backend's ffmpeg layer scales and crops to the real aspect ratio, and a
@@ -138,82 +149,82 @@ class GenerationRequest:
 
 
 class LTXRunner:
-    """Runs the official LTX-Video inference script.
+    """In-process diffusers pipeline for the LTX-Video distilled checkpoint.
 
-    Shelling out rather than importing keeps this worker off the project's
-    internal Python API, which is not a stability promise. The model still
-    loads once per generation in this mode; see `warm_up` for the tradeoff.
+    Loads the model once in `warm_up()` and keeps it resident in
+    `self.pipeline` for the life of the worker process - unlike shelling out
+    to the official repo's `inference.py`, which reloads weights on every
+    scene. Applies `enable_model_cpu_offload()`, attention slicing, and VAE
+    tiling/slicing, the standard diffusers techniques for fitting this model
+    family in a T4's 16 GB.
+
+    reference_image (image-to-video) is accepted from the job but not yet
+    used here - text-to-video only, the same documented gap as the Wan
+    worker's GenerationRequest.
     """
 
-    def __init__(self, repo_dir: str, pipeline_config: str, device: str = "0"):
-        self.repo_dir = Path(repo_dir)
-        self.pipeline_config = pipeline_config
+    def __init__(self, model_id: str, device: str = "0"):
+        self.model_id = model_id
         self.device = device
+        self.pipeline = None
 
     def describe(self) -> str:
-        return f"LTX-Video ({self.pipeline_config})"
+        return f"LTX-Video distilled ({self.model_id}, diffusers, in-process)"
 
     def warm_up(self) -> None:
-        """Fail fast if the checkout or config is missing.
+        """Load the model once and keep it resident on the GPU."""
+        import torch
+        from diffusers import LTXConditionPipeline
 
-        `inference.py` loads weights per invocation, so there is nothing to
-        pre-load here. If per-scene load time proves to dominate, the next
-        step is a long-lived in-process pipeline; that is a deliberate
-        follow-up rather than something to guess at now.
-        """
-        script = self.repo_dir / "inference.py"
-        config_path = self.repo_dir / self.pipeline_config
-        if not script.exists():
-            raise RuntimeError(
-                f"LTX-Video checkout not found at {self.repo_dir}."
-                " See kaggle/README.md for setup."
-            )
-        if not config_path.exists():
-            raise RuntimeError(f"pipeline config not found: {config_path}")
-        log.info("using %s on cuda:%s", self.describe(), self.device)
+        # A T4 is Turing (sm_75) and has no bfloat16 support, so fp16 is used
+        # even though the diffusers example for this checkpoint uses bf16.
+        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
+        log.info("loading %s (dtype=%s)...", self.describe(), dtype)
+        pipeline = LTXConditionPipeline.from_pretrained(self.model_id, torch_dtype=dtype)
+        if torch.cuda.is_available():
+            pipeline.enable_model_cpu_offload(device=f"cuda:{self.device}")
+        else:
+            pipeline = pipeline.to("cpu")
+        if hasattr(pipeline, "enable_attention_slicing"):
+            pipeline.enable_attention_slicing()
+        vae = getattr(pipeline, "vae", None)
+        if vae is not None:
+            if hasattr(vae, "enable_tiling"):
+                vae.enable_tiling()
+            if hasattr(vae, "enable_slicing"):
+                vae.enable_slicing()
+        self.pipeline = pipeline
+        log.info("%s ready", self.describe())
 
     def generate(self, request: GenerationRequest, out: Path) -> None:
+        if self.pipeline is None:
+            raise RuntimeError("warm_up() was not called before generate()")
+
+        import torch
+        from diffusers.utils import export_to_video
+
         gen_w, gen_h = generation_size(request.width, request.height)
         frames = frame_count(request.seconds)
-        work = Path(tempfile.mkdtemp(prefix="ltx-out-"))
+        steps = steps_for_quality(request.quality)
+        seed = random.randint(1, 2**31 - 1)
 
-        cmd = [
-            sys.executable, "inference.py",
-            "--prompt", request.prompt,
-            "--height", str(gen_h),
-            "--width", str(gen_w),
-            "--num_frames", str(frames),
-            "--frame_rate", str(GEN_FPS),
-            "--seed", str(random.randint(1, 2**31 - 1)),
-            "--pipeline_config", self.pipeline_config,
-            "--output_path", str(work),
-            "--offload_to_cpu", "True",
-        ]
-        if request.reference_image and request.reference_image.exists():
-            # Image-to-video: the still conditions the opening frame.
-            cmd += ["--conditioning_media_paths", str(request.reference_image),
-                    "--conditioning_start_frames", "0"]
-
-        env = dict(os.environ, CUDA_VISIBLE_DEVICES=self.device)
         log.info(
             "generating %s frames at %dx%d (%.1fs at %dfps), steps=%d",
-            frames, gen_w, gen_h, request.seconds, GEN_FPS,
-            steps_for_quality(request.quality),
+            frames, gen_w, gen_h, request.seconds, GEN_FPS, steps,
         )
-        try:
-            proc = subprocess.run(
-                cmd, cwd=self.repo_dir, env=env, capture_output=True,
-                text=True, timeout=GENERATION_TIMEOUT,
-            )
-            if proc.returncode != 0:
-                tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-8:]
-                raise RuntimeError("inference.py failed: " + " | ".join(tail))
-            produced = sorted(work.rglob("*.mp4"))
-            if not produced:
-                raise RuntimeError("inference.py produced no mp4")
-            shutil.move(str(produced[0]), out)
-        finally:
-            shutil.rmtree(work, ignore_errors=True)
+        output = self.pipeline(
+            prompt=request.prompt,
+            width=gen_w,
+            height=gen_h,
+            num_frames=frames,
+            num_inference_steps=steps,
+            guidance_scale=GUIDANCE_SCALE,
+            generator=torch.Generator(device="cpu").manual_seed(seed),
+        )
+        export_to_video(output.frames[0], str(out), fps=GEN_FPS)
+        if not out.exists() or out.stat().st_size == 0:
+            raise RuntimeError("export_to_video produced no output file")
 
 
 class DryRunRunner:
@@ -405,8 +416,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     runner = DryRunRunner() if args.dry_run else LTXRunner(
-        repo_dir=LTX_REPO_DIR,
-        pipeline_config=LTX_PIPELINE_CONFIG,
+        model_id=LTX_MODEL_ID,
         device=CUDA_DEVICE,
     )
     try:

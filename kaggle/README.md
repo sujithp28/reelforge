@@ -59,25 +59,28 @@ and accepting one would quietly produce a reel shorter than the storyboard.
 
 ## Model choice
 
-Default: **`ltxv-2b-0.9.8-distilled`**, run through the official LTX-Video
-repository's `inference.py` with `--pipeline_config`.
+Default: **`Lightricks/LTX-Video-0.9.7-distilled`**, loaded in-process via
+diffusers' `LTXConditionPipeline.from_pretrained()`.
 
 Why this one:
 
-- The checkpoint is about 6.3 GB, so it fits a T4's 16 GB with room for
-  activations. The 13B fp16 checkpoint does not fit comfortably and is not
-  the default.
-- It is guidance- and timestep-distilled: `guidance_scale` 1.0 and roughly
-  8 steps, which is what makes generation times tolerable on a T4.
-- The official model card documents `inference.py --pipeline_config` as the
-  way to run it. Shelling out to that keeps the worker off the project's
-  internal Python API, which is not a stability promise.
+- It's diffusers-native: `from_pretrained()` downloads and caches the weights
+  directly from the Hugging Face repo, no separate LTX-Video checkout, custom
+  loader, or YAML pipeline config needed - unlike the raw `.safetensors`
+  checkpoints the official repo's `inference.py` script expects.
+- The checkpoint is 2B-class, so with `enable_model_cpu_offload()` plus
+  attention/VAE slicing and tiling it targets a T4's 16 GB. (A prior CLI-based
+  runner using the official `inference.py`, with and without the spatial
+  upscaler, reliably ran out of memory on a real T4 loading the checkpoint +
+  text encoder alone - see "Known limitations" below.)
+- It's guidance-distilled: `guidance_scale` 1.0 and roughly 8 steps, which is
+  what makes generation times tolerable on a T4.
 
 A T4 is Turing (sm_75) and has **no bfloat16 support**, so fp16 is used. Many
 LTX examples show bf16; those target Ampere or newer.
 
-The model is configuration, not a constant: set
-`REELFORGE_LTX_PIPELINE_CONFIG` to any config in the checkout.
+The model is configuration, not a constant: set `REELFORGE_LTX_MODEL_ID` to
+any diffusers-compatible LTX repo on Hugging Face.
 
 ## Generation geometry
 
@@ -144,10 +147,15 @@ a bug.
 The original beta provider (`kaggle`), kept for now. Same accelerator and
 worker-token setup as above.
 
+Runs `Lightricks/LTX-Video-0.9.7-distilled` in-process via diffusers'
+`LTXConditionPipeline` - no separate LTX-Video repo checkout or custom
+`--pipeline_config` YAML needed. `diffusers` downloads and caches the weights
+itself on first `from_pretrained()` call, the same way `wan_worker.py`
+handles Wan.
+
 ```python
-# Cell 1 - dependencies and the model repo
-!git clone https://github.com/Lightricks/LTX-Video.git /kaggle/working/LTX-Video
-!pip -q install -e /kaggle/working/LTX-Video
+# Cell 1 - dependencies (no repo clone; diffusers loads the model directly)
+!pip -q install diffusers transformers accelerate
 
 # Cell 2 - the worker (from your repo, or uploaded as a dataset)
 !git clone https://github.com/sujithp28/reelforge.git /kaggle/working/reelforge
@@ -157,7 +165,6 @@ import os
 from kaggle_secrets import UserSecretsClient
 os.environ["REELFORGE_API_BASE"] = "https://your-public-url"
 os.environ["REELFORGE_WORKER_TOKEN"] = UserSecretsClient().get_secret("REELFORGE_WORKER_TOKEN")
-os.environ["REELFORGE_LTX_REPO_DIR"] = "/kaggle/working/LTX-Video"
 os.environ["REELFORGE_CUDA_DEVICE"] = "0"
 
 # Cell 4 - run it
@@ -204,8 +211,8 @@ Worker side (set in the Kaggle session):
 | `REELFORGE_API_BASE` | required | Public HTTPS URL of the backend |
 | `REELFORGE_WORKER_TOKEN` | required | Must match the backend's token |
 | `REELFORGE_WORKER_ID` | `kaggle-1` | Shown in logs; distinguishes workers |
-| `REELFORGE_LTX_REPO_DIR` | `/kaggle/working/LTX-Video` | LTX-Video checkout |
-| `REELFORGE_LTX_PIPELINE_CONFIG` | `configs/ltxv-2b-0.9.8-distilled.yaml` | Model config |
+| `REELFORGE_LTX_MODEL_ID` | `Lightricks/LTX-Video-0.9.7-distilled` | HF repo id, loaded via `LTXConditionPipeline.from_pretrained` |
+| `REELFORGE_LTX_GUIDANCE_SCALE` | `1.0` | Guidance scale (distilled checkpoints want ~1.0, not 3+) |
 | `REELFORGE_CUDA_DEVICE` | `0` | Which GPU to use |
 | `REELFORGE_GEN_SHORT_EDGE` | `480` | Generation short edge (÷32) |
 | `REELFORGE_GEN_LONG_EDGE` | `832` | Generation long edge (÷32) |
@@ -213,7 +220,7 @@ Worker side (set in the Kaggle session):
 | `REELFORGE_STEPS_STANDARD` | `8` | Steps for Standard quality |
 | `REELFORGE_STEPS_HIGH` | `10` | Steps for High quality |
 | `REELFORGE_MAX_SCENE_SECONDS` | `20` | Refuse scenes longer than this |
-| `REELFORGE_GENERATION_TIMEOUT` | `1500` | Per-scene subprocess timeout |
+| `REELFORGE_GENERATION_TIMEOUT` | `1500` | Reserved; not currently enforced (same as `wan_worker.py`) - the backend's `REELFORGE_KAGGLE_CLAIM_TIMEOUT` requeues a stuck job instead |
 
 Backend side: see `.env.example` for `REELFORGE_KAGGLE_*`.
 
@@ -232,13 +239,17 @@ Backend side: see `.env.example` for `REELFORGE_KAGGLE_*`.
 
 ## Known limitations
 
-- **The GPU path has never been run.** There is no GPU or model checkout in
-  the development environment, so `LTXRunner` is untested against real
-  weights. Everything else, including the full queue, upload, normalisation
-  and retry flow, is verified with the `--dry-run` runner.
-- `inference.py` loads weights per invocation, so per-scene startup cost is
-  real. If it dominates, the next step is a long-lived in-process pipeline.
-- Standard and High both use the same 2B distilled checkpoint in beta, and
+- **The GPU path is unverified.** There is no GPU in the development
+  environment. A prior CLI-based `LTXRunner` (shelling out to the official
+  LTX-Video repo's `inference.py`) was tested on a real Kaggle T4 and
+  reliably hit `torch.OutOfMemoryError` loading the 2B distilled checkpoint +
+  text encoder alone (14.56 GiB total, both with and without the spatial
+  upscaler) - this in-process diffusers rewrite is meant to fix that with
+  `enable_model_cpu_offload()` plus attention/VAE slicing and tiling, but
+  has not itself been run against real weights yet. Everything else,
+  including the full queue, upload, normalisation and retry flow, is
+  verified with the `--dry-run` runner.
+- Standard and High both use the same distilled checkpoint in beta, and
   differ only in step count. The UI does not claim otherwise.
 - No visual consistency guarantees between scenes.
 - One worker generates one scene at a time.
