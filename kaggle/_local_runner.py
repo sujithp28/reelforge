@@ -27,7 +27,7 @@ def load_pipeline(
     model_id: str,
     device: str = "0",
     dtype_fixups: dict[str, "object"] | None = None,
-    device_map: str | None = None,
+    device_map: "str | dict[str, int] | None" = None,
 ):
     """Load `pipeline_class` from `model_id` with T4-safe memory settings.
 
@@ -41,9 +41,10 @@ def load_pipeline(
             (e.g. {"vae": torch.float32, "transformer": torch.float16}).
             Not compatible with `device_map` (accelerate hooks a dispatched
             module's `.to()`, so a manual cast after load would corrupt it).
-        device_map: e.g. "balanced" to have accelerate stream each shard
-            straight from its mmap'd safetensors file to its target GPU
-            during `from_pretrained`, instead of fully materialising the
+        device_map: "balanced" or an explicit {component_name: device_index}
+            dict (e.g. {"transformer": 1}), to have accelerate stream each
+            shard straight from its mmap'd safetensors file to its target
+            GPU during `from_pretrained`, instead of fully materialising the
             checkpoint in host RAM first. For a checkpoint with no fp16
             variant (fp32-only on disk), this is the difference between
             fitting a low-RAM session and OOM-ing partway through loading,
@@ -51,7 +52,11 @@ def load_pipeline(
             what `low_cpu_mem_usage=True` alone still doesn't avoid. Spreads
             across both T4s rather than offloading to CPU, so it needs the
             checkpoint's fp16 footprint to fit in combined GPU VRAM instead
-            of in system RAM.
+            of in system RAM. Prefer an explicit dict over "balanced" when a
+            single component is large enough that "balanced" would split it
+            layer-by-layer across devices - that produces tensors on two
+            devices within one forward pass, which crashes at inference
+            time, not at load time.
 
     Returns the loaded pipeline, offloaded/sliced/tiled and ready to call.
     """

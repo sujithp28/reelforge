@@ -177,14 +177,22 @@ class LTXRunner:
         from _local_runner import load_pipeline
 
         log.info("loading %s...", self.describe())
-        # device_map="balanced": this checkpoint is fp32-only on disk (no
-        # fp16 variant), and converting it to fp16 in host RAM during a
-        # plain from_pretrained() OOMs a low-RAM session (verified on a
-        # Kaggle T4x2 session: 31GB RAM, 0 swap). Spreading the load across
-        # both T4s' combined 32GB VRAM instead sidesteps host RAM for this
-        # step entirely - see kaggle/README.md "Known limitations".
+        # This checkpoint is fp32-only on disk (no fp16 variant), and
+        # converting it to fp16 in host RAM during a plain from_pretrained()
+        # OOMs a low-RAM session (verified on Kaggle T4x2: 31GB RAM, 0 swap).
+        # device_map="balanced" fixed that by streaming shards straight to
+        # GPU, but it auto-balances by splitting individual large modules
+        # (the transformer) layer-by-layer across both GPUs, which crashes
+        # generation with "tensors on cuda:0 and cuda:1" - a single forward
+        # pass' output lands split across devices. Each whole component
+        # actually fits on one T4 (transformer ~13GB, text_encoder ~9.5GB,
+        # vae ~1.25GB fp16), so an explicit per-component map keeps every
+        # module intact on a single device and avoids the intra-module
+        # split - see kaggle/README.md "Known limitations".
+        component_device_map = {"text_encoder": 0, "vae": 0, "transformer": 1}
         self.pipeline = load_pipeline(
-            "LTXConditionPipeline", self.model_id, self.device, device_map="balanced",
+            "LTXConditionPipeline", self.model_id, self.device,
+            device_map=component_device_map,
         )
         log.info("%s ready", self.describe())
 
