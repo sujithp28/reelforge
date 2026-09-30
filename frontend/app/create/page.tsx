@@ -29,6 +29,9 @@ function CreateForm() {
   const [step, setStep] = useState(1);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Set once create succeeds, so a failed reference upload can be retried
+  // against the same project instead of silently building a title-card reel.
+  const [createdId, setCreatedId] = useState<string | null>(null);
 
   const ready = useMemo(() => idea.trim().length > 0, [idea]);
 
@@ -36,24 +39,26 @@ function CreateForm() {
     setBusy(true);
     setError(null);
     try {
-      const project = await api.createProject({
-        idea: idea.trim(),
-        category: type,
-        input_type: input,
-        duration,
-        aspect_ratio: ratio,
-        quality,
-      });
-      // Uploads need a project to attach to, so the staged file goes up second.
-      if (file) {
-        try {
-          await api.upload(project.id, file);
-        } catch (e) {
-          // The storyboard exists either way; don't lose it over a bad file.
-          console.warn("reference upload failed", e);
-        }
+      let projectId = createdId;
+      if (!projectId) {
+        const project = await api.createProject({
+          idea: idea.trim(),
+          category: type,
+          input_type: input,
+          duration,
+          aspect_ratio: ratio,
+          quality,
+        });
+        projectId = project.id;
+        setCreatedId(projectId);
       }
-      router.push(`/projects/${project.id}`);
+      // Uploads need a project to attach to, so the staged file goes up second.
+      // A failure here used to be discarded, and every scene then rendered as
+      // a title card with no sign the photo never landed.
+      if (file) {
+        await api.upload(projectId, file);
+      }
+      router.push(`/projects/${projectId}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not create the storyboard.");
       setBusy(false);
@@ -155,7 +160,7 @@ function CreateForm() {
                 {INPUT_TYPES.map(x => <button key={x} onClick={() => setInput(x)} className={`rounded-lg px-3 py-2 text-xs ${input === x ? "bg-white text-zinc-950" : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700"}`}>{x}</button>)}
               </div>
 
-              {input !== "Idea" && !file && (
+              {!file && (
                 <label className="mt-4 flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border border-dashed border-zinc-700 p-7 text-sm text-zinc-400 hover:bg-zinc-950">
                   <Upload size={18}/> Upload reference <ImagePlus size={18}/>
                   <input

@@ -94,23 +94,50 @@ def _drawtext(caption: str, width: int, height: int, big: bool) -> str:
     )
 
 
+def _even(value: int) -> int:
+    """H.264 needs even dimensions. Round down so a crop never exceeds the frame."""
+    value = int(value)
+    return value if value % 2 == 0 else value - 1
+
+
 def build_still_clip_cmd(
     image: str, out: str, seconds: int, width: int, height: int, caption: str | None
 ) -> list[str]:
-    """Ken Burns push-in over an uploaded still."""
+    """Slow Ken Burns move over an uploaded still.
+
+    The photo is scaled to cover the frame, then a window of the output's
+    aspect ratio eases in and drifts across the spare image. The move follows
+    the frame index, so it runs once across the scene.
+
+    zoompan does not do this on a still: it holds the first zoom step for the
+    whole clip. An animated crop is the move that actually reaches the picture.
+    """
     frames = max(1, seconds * FPS)
+    span = max(frames - 1, 1)
+    # Larger than the tightest window, so the push-in has pixels to reveal
+    # and a wide photo still has room to drift.
+    cover_w = _even(round(width * 1.18))
+    cover_h = _even(round(height * 1.18))
+    progress = f"n/{span}"
+    # Window goes from 1.10x the frame down to the frame: a 10% push-in.
+    zoom = f"(1.10-0.10*{progress})"
+    # Commas inside min() have to be escaped or ffmpeg splits the filtergraph.
+    window_w = f"min(in_w\\,trunc({width}*{zoom}/2)*2)"
+    window_h = f"min(in_h\\,trunc({height}*{zoom}/2)*2)"
+    # A short drift through the spare margin, not a sweep of the whole photo.
+    x = f"(in_w-out_w)*(0.40+0.20*{progress})"
+    y = f"(in_h-out_h)*(0.55-0.10*{progress})"
     chain = [
-        f"scale={width * 2}:{height * 2}:force_original_aspect_ratio=increase",
-        f"crop={width}:{height}",
-        f"zoompan=z='min(zoom+0.0012,1.18)':d={frames}:x='iw/2-(iw/zoom/2)'"
-        f":y='ih/2-(ih/zoom/2)':s={width}x{height}:fps={FPS}",
+        f"scale={cover_w}:{cover_h}:force_original_aspect_ratio=increase",
+        f"crop=w='{window_w}':h='{window_h}':x='{x}':y='{y}'",
+        f"scale={width}:{height}:flags=lanczos",
     ]
     if caption:
         chain.append(_drawtext(caption, width, height, big=False))
     chain.append("format=yuv420p")
     return [
         "ffmpeg", "-y", "-loglevel", "error",
-        "-loop", "1", "-i", image,
+        "-loop", "1", "-framerate", str(FPS), "-i", image,
         "-t", str(seconds),
         "-vf", ",".join(chain),
         "-r", str(FPS),

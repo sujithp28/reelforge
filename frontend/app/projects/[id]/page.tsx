@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import {
@@ -316,7 +316,6 @@ function SceneCard({
   const [prompt, setPrompt] = useState(scene.prompt);
   const [caption, setCaption] = useState(scene.caption ?? "");
   const [duration, setDuration] = useState(scene.duration);
-  const fileRef = useRef<HTMLInputElement>(null);
 
   // The API returns the whole project after every mutation, so reset the draft
   // fields whenever the server's version of this scene changes.
@@ -332,10 +331,9 @@ function SceneCard({
 
   return (
     <div className="grid gap-4 rounded-2xl border border-zinc-800 bg-zinc-900 p-5 md:grid-cols-[90px_1fr_auto] md:items-start">
-      <button
-        onClick={() => fileRef.current?.click()}
+      <label
         title="Replace this scene's still"
-        className="group relative flex h-20 w-full items-center justify-center overflow-hidden rounded-xl bg-zinc-800 text-2xl"
+        className="group relative flex h-20 w-full cursor-pointer items-center justify-center overflow-hidden rounded-xl bg-zinc-800 text-2xl"
       >
         {thumb
           ? <img src={thumb} alt="" className="h-full w-full object-cover" />
@@ -343,18 +341,17 @@ function SceneCard({
         <span className="absolute inset-0 hidden items-center justify-center bg-black/60 group-hover:flex">
           <ImagePlus size={18} />
         </span>
-      </button>
-      <input
-        ref={fileRef}
-        type="file"
-        accept="image/jpeg,image/png,image/webp,image/bmp"
-        className="hidden"
-        onChange={e => {
-          const f = e.target.files?.[0];
-          if (f) onUpload(f);
-          e.target.value = "";
-        }}
-      />
+        <input
+          type="file"
+          accept="image/jpeg,image/png,image/webp,image/bmp"
+          className="sr-only"
+          onChange={e => {
+            const f = e.target.files?.[0];
+            if (f) onUpload(f);
+            e.target.value = "";
+          }}
+        />
+      </label>
 
       {editing ? (
         <div className="space-y-3">

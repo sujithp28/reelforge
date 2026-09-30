@@ -3,9 +3,19 @@ building. Plain asserts, no test framework.
 
     python test_reelforge.py
 """
+import os
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
+
+# Set before anything imports app.config. The image-reel test renders through
+# the real upload and job path, and config reads these once at import.
+_IMAGE_REEL_ROOT = Path(tempfile.mkdtemp(prefix="reelforge-image-reel-"))
+os.environ["REELFORGE_DATA_DIR"] = str(_IMAGE_REEL_ROOT)
+os.environ["REELFORGE_JOB_RUNNER"] = "external"
+os.environ["REELFORGE_VIDEO_PROVIDER"] = "mock"
+os.environ["REELFORGE_STORAGE"] = "local"
 
 from app import ffmpeg, storyboard
 
@@ -120,7 +130,9 @@ def test_still_clip_command_is_wellformed():
     assert cmd[0] == "ffmpeg"
     assert "-y" in cmd and "in.jpg" in cmd and cmd[-1] == "out.mp4"
     vf = cmd[cmd.index("-vf") + 1]
-    assert "zoompan" in vf and "1080:1920" in vf and "drawtext" in vf
+    assert "scale=1080:1920" in vf and "drawtext" in vf and "crop=w=" in vf
+    # zoompan holds the first step on a still, so the move is an animated crop.
+    assert "zoompan" not in vf, vf
     assert f"-t" in cmd
 
 
@@ -216,6 +228,156 @@ def test_concat_file_escapes_quotes():
     body = ffmpeg.build_concat_list(["a b.mp4", "it's.mp4"])
     assert "'a b.mp4'" in body
     assert "it'\\''s.mp4" in body or "it\\'s.mp4" in body, body
+
+
+def _rgb(video: Path, at: float, crop: str) -> tuple[float, float, float]:
+    """Average colour of a crop at `at` seconds. Used to tell a photo from a card."""
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-ss", str(at), "-i", str(video),
+            "-frames:v", "1", "-vf", f"crop={crop},scale=8:8",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+        ],
+        capture_output=True, check=True,
+    )
+    data = proc.stdout
+    pixels = len(data) // 3
+    assert pixels > 0, "frame sample was empty"
+    return (
+        sum(data[i] for i in range(0, len(data), 3)) / pixels,
+        sum(data[i + 1] for i in range(0, len(data), 3)) / pixels,
+        sum(data[i + 2] for i in range(0, len(data), 3)) / pixels,
+    )
+
+
+def _frame_delta(video: Path, a: float, b: float) -> float:
+    """Mean absolute RGB difference between two frames. A static card is ~0."""
+    def raw(at: float) -> bytes:
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-v", "error", "-ss", str(at), "-i", str(video),
+                "-frames:v", "1", "-vf", "scale=48:86",
+                "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+            ],
+            capture_output=True, check=True,
+        )
+        return proc.stdout
+
+    left, right = raw(a), raw(b)
+    n = min(len(left), len(right))
+    assert n > 0
+    return sum(abs(left[i] - right[i]) for i in range(n)) / n
+
+
+def _hex_rgb(value: str) -> tuple[int, int, int]:
+    value = value.removeprefix("0x")
+    return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+
+
+def test_uploaded_image_is_in_the_reel_and_cards_remain_without_one():
+    """Upload path: one scene with a still, one without, exact duration.
+
+    The still must survive project -> scene reference -> mock generator ->
+    ffmpeg. A scene with no still still gets a title card.
+    """
+    if not ffmpeg.ffmpeg_available():
+        print("  (skipped image reel: ffmpeg not on PATH)")
+        return
+
+    root = _IMAGE_REEL_ROOT
+    try:
+        # Imported after the env is set: config reads it once, at import.
+        from fastapi.testclient import TestClient
+
+        from app import jobs
+        from app.main import app
+
+        client = TestClient(app)
+        project = client.post("/api/projects", json={
+            "idea": "a modern living room",
+            "category": "Cinematic",
+            "duration": 6,
+            "aspect_ratio": "9:16",
+        })
+        assert project.status_code == 201, project.text
+        body = project.json()
+        scenes = body["scenes"]
+        assert sum(s["duration"] for s in scenes) == 6, scenes
+        assert len(scenes) >= 2
+
+        still = root / "room.png"
+        # Wide split so a portrait Ken Burns both shows the photo and moves.
+        ffmpeg.run([
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=c=0xE23B2F:s=640x720",
+            "-f", "lavfi", "-i", "color=c=0x1F8A4C:s=640x720",
+            "-filter_complex", "hstack=inputs=2",
+            "-frames:v", "1", str(still),
+        ])
+        uploaded = client.post(
+            f"/api/projects/{body['id']}/uploads",
+            params={"scene_id": scenes[0]["id"]},
+            files={"file": ("room.png", still.read_bytes(), "image/png")},
+        )
+        assert uploaded.status_code == 201, uploaded.text
+        linked = {s["id"]: s for s in uploaded.json()["scenes"]}
+        assert linked[scenes[0]["id"]]["asset_url"], "upload did not attach to the scene"
+        assert not linked[scenes[1]["id"]]["asset_url"]
+
+        captioned = client.patch(
+            f"/api/projects/{body['id']}/scenes/{scenes[0]['id']}",
+            json={"caption": "Warm light"},
+        )
+        assert captioned.status_code == 200, captioned.text
+
+        tone = root / "tone.wav"
+        _media(tone, 2, audio=True)
+        music = client.post(
+            f"/api/projects/{body['id']}/uploads",
+            files={"file": ("tone.wav", tone.read_bytes(), "audio/wav")},
+        )
+        assert music.status_code == 201, music.text
+
+        started = client.post(f"/api/projects/{body['id']}/render", json={})
+        assert started.status_code == 202, started.text
+        jobs._execute(started.json()["job_id"], body["id"])
+
+        finished = client.get(f"/api/projects/{body['id']}")
+        assert finished.status_code == 200, finished.text
+        done = finished.json()
+        assert done["status"] == "ready", done.get("error")
+        video_key = done["video_url"].split("/media/", 1)[1]
+        video = root / video_key
+        assert video.exists(), video
+
+        duration = ffmpeg.probe_duration(str(video))
+        assert duration is not None and abs(duration - 6) < 0.05, duration
+        info = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,r_frame_rate",
+             "-of", "csv=p=0", str(video)],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        assert info == "1080,1920,30/1", info
+
+        # Top-left of the photo scene is the red half, not an indigo card.
+        photo = _rgb(video, 0.4, "80:80:40:80")
+        assert photo[0] > 140 and photo[0] > photo[2] + 40, photo
+        for color in ffmpeg.CARD_COLORS:
+            card = _hex_rgb(color)
+            distance = sum(abs(photo[i] - card[i]) for i in range(3))
+            assert distance > 80, (photo, color, distance)
+        # The move is visible: a static slideshow would match frame to frame.
+        assert _frame_delta(video, 0.25, scenes[0]["duration"] - 0.3) > 4
+
+        # The next scene has no still, so it stays a title card.
+        card_at = scenes[0]["duration"] + 0.4
+        painted = _rgb(video, card_at, "80:80:40:80")
+        expect = _hex_rgb(ffmpeg.CARD_COLORS[1])
+        gap = sum(abs(painted[i] - expect[i]) for i in range(3))
+        assert gap < 45, (painted, expect, gap)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def demo():
