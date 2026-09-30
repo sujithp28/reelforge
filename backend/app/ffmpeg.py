@@ -15,6 +15,10 @@ import subprocess
 from pathlib import Path
 
 FPS = 30
+# 16 frames at 30fps is 0.533s: inside the 0.4–0.6s range, and even, so the
+# dissolve can be split evenly across the scene boundary without a half frame.
+CROSSFADE_FRAMES = 16
+CROSSFADE_SECONDS = CROSSFADE_FRAMES / FPS
 # Scene-card background hues, cycled by scene index so a reel without uploads
 # still has visual variety.
 CARD_COLORS = ["0x1e1b4b", "0x312e81", "0x4c1d95", "0x1e293b", "0x3b0764", "0x172554"]
@@ -100,33 +104,71 @@ def _even(value: int) -> int:
     return value if value % 2 == 0 else value - 1
 
 
+def _motion(index: int, progress: str) -> tuple[str, str, str]:
+    """Zoom and pan for one scene. The path repeats every five scenes.
+
+    A larger crop window shows more of the photo (zoomed out). The widest
+    window stays under the cover scale so the crop never asks for pixels
+    the scaled photo does not have.
+    """
+    kind = ("zoom_out", "pan_x", "zoom_in", "zoom_out_pan", "drift_y")[index % 5]
+    if kind == "zoom_out":
+        # Gentle zoom-out, with a small upward drift.
+        return (
+            f"(1.02+0.06*{progress})",
+            f"(in_w-out_w)*(0.28+0.44*{progress})",
+            f"(in_h-out_h)*(0.58-0.16*{progress})",
+        )
+    if kind == "pan_x":
+        # Hold the scale and travel across the spare width.
+        return (
+            "1.04",
+            f"(in_w-out_w)*(0.18+0.64*{progress})",
+            "(in_h-out_h)*0.50",
+        )
+    if kind == "zoom_in":
+        return (
+            f"(1.08-0.06*{progress})",
+            f"(in_w-out_w)*(0.42+0.16*{progress})",
+            "(in_h-out_h)*0.48",
+        )
+    if kind == "zoom_out_pan":
+        return (
+            f"(1.03+0.05*{progress})",
+            f"(in_w-out_w)*(0.72-0.44*{progress})",
+            "(in_h-out_h)*0.42",
+        )
+    return (
+        f"(1.06-0.03*{progress})",
+        "(in_w-out_w)*0.50",
+        f"(in_h-out_h)*(0.22+0.56*{progress})",
+    )
+
+
 def build_still_clip_cmd(
-    image: str, out: str, seconds: int, width: int, height: int, caption: str | None
+    image: str, out: str, seconds: int, width: int, height: int, caption: str | None,
+    index: int = 0,
 ) -> list[str]:
     """Slow Ken Burns move over an uploaded still.
 
-    The photo is scaled to cover the frame, then a window of the output's
-    aspect ratio eases in and drifts across the spare image. The move follows
-    the frame index, so it runs once across the scene.
+    The photo is scaled to cover the frame, preserving its aspect ratio, then
+    a window eases across the spare margin. The move follows the frame index
+    and the scene index, so each scene takes a different path and a re-render
+    repeats that path.
 
     zoompan does not do this on a still: it holds the first zoom step for the
     whole clip. An animated crop is the move that actually reaches the picture.
     """
     frames = max(1, seconds * FPS)
     span = max(frames - 1, 1)
-    # Larger than the tightest window, so the push-in has pixels to reveal
-    # and a wide photo still has room to drift.
-    cover_w = _even(round(width * 1.18))
-    cover_h = _even(round(height * 1.18))
+    # Just enough spare image for a 6–8% move plus a short drift.
+    cover_w = _even(round(width * 1.16))
+    cover_h = _even(round(height * 1.16))
     progress = f"n/{span}"
-    # Window goes from 1.10x the frame down to the frame: a 10% push-in.
-    zoom = f"(1.10-0.10*{progress})"
+    zoom, x, y = _motion(index, progress)
     # Commas inside min() have to be escaped or ffmpeg splits the filtergraph.
     window_w = f"min(in_w\\,trunc({width}*{zoom}/2)*2)"
     window_h = f"min(in_h\\,trunc({height}*{zoom}/2)*2)"
-    # A short drift through the spare margin, not a sweep of the whole photo.
-    x = f"(in_w-out_w)*(0.40+0.20*{progress})"
-    y = f"(in_h-out_h)*(0.55-0.10*{progress})"
     chain = [
         f"scale={cover_w}:{cover_h}:force_original_aspect_ratio=increase",
         f"crop=w='{window_w}':h='{window_h}':x='{x}':y='{y}'",
@@ -170,6 +212,75 @@ def build_concat_list(paths: list[str]) -> str:
     quote, backslash = chr(39), chr(92)
     escaped = quote + backslash + quote + quote
     return "".join(f"file '{p.replace(quote, escaped)}'\n" for p in paths)
+
+
+def build_crossfade_cmd(
+    paths: list[str], durations: list[int], out: str,
+) -> list[str]:
+    """Dissolve between clips and keep the reel at the sum of `durations`.
+
+    Each join overlaps by CROSSFADE_FRAMES, centered on the scene boundary.
+    The overlap is made of cloned edge frames, so the dissolve never falls
+    through to black, and the picture still ends at exactly sum(durations).
+    """
+    if len(paths) != len(durations) or len(paths) < 2:
+        raise ValueError("a crossfade needs at least two clips")
+    half = CROSSFADE_FRAMES // 2
+    filters: list[str] = []
+    for i, seconds in enumerate(durations):
+        start = 0 if i == 0 else half
+        stop = 0 if i == len(durations) - 1 else half
+        pad: list[str] = []
+        if start:
+            pad += [f"start_mode=clone", f"start_duration={start / FPS:.6f}"]
+        if stop:
+            pad += [f"stop_mode=clone", f"stop_duration={stop / FPS:.6f}"]
+        chain = ",".join([
+            "tpad=" + ":".join(pad),
+            "setpts=PTS-STARTPTS",
+            f"fps={FPS}",
+            "format=yuv420p",
+        ])
+        filters.append(f"[{i}:v]{chain}[v{i}]")
+
+    running = durations[0] * FPS + half
+    current = "v0"
+    for i in range(1, len(durations)):
+        start = half
+        stop = 0 if i == len(durations) - 1 else half
+        length = durations[i] * FPS + start + stop
+        offset = running - CROSSFADE_FRAMES
+        if offset < 0:
+            raise ValueError("scene is shorter than the crossfade")
+        label = f"x{i}"
+        filters.append(
+            f"[{current}][v{i}]xfade=transition=fade"
+            f":duration={CROSSFADE_SECONDS:.6f}:offset={offset / FPS:.6f}[{label}]"
+        )
+        running = running + length - CROSSFADE_FRAMES
+        current = label
+
+    total_frames = sum(durations) * FPS
+    # xfade lands one frame short of the arithmetic length. Clone that frame
+    # and trim so the container duration is exactly sum(durations).
+    filters.append(
+        f"[{current}]tpad=stop_mode=clone:stop_duration=0.1,"
+        f"trim=end_frame={total_frames},setpts=PTS-STARTPTS[vout]"
+    )
+    cmd = ["ffmpeg", "-y", "-loglevel", "error"]
+    for path in paths:
+        cmd += ["-i", path]
+    cmd += [
+        "-filter_complex", ";".join(filters),
+        "-map", "[vout]",
+        "-frames:v", str(total_frames),
+        "-r", str(FPS),
+        "-fps_mode", "cfr",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+        "-pix_fmt", "yuv420p", "-an",
+        out,
+    ]
+    return cmd
 
 
 def build_concat_cmd(list_file: str, out: str) -> list[str]:

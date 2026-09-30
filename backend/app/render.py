@@ -128,6 +128,8 @@ def scene_fingerprint(spec: SceneSpec, provider: str) -> str:
         f"{spec.width}x{spec.height}",
         str(spec.fps),
         spec.quality,
+        # Motion follows the scene index, so a moved scene cannot reuse a clip.
+        str(spec.index),
         # The asset id is part of an uploaded file's name, so a replaced
         # reference image produces a different name and a different clip.
         Path(spec.image_path).name if spec.image_path else "",
@@ -235,14 +237,20 @@ def render_reel(
         if hooks.should_cancel():
             raise RenderCancelled("cancelled before assembly")
 
-        list_file = work_dir / "concat.txt"
-        list_file.write_text(
-            ffmpeg.build_concat_list([str(c) for c in clips]), encoding="utf-8"
-        )
-
         out_path.parent.mkdir(parents=True, exist_ok=True)
         joined = work_dir / "joined.mp4"
-        ffmpeg.run(ffmpeg.build_concat_cmd(str(list_file), str(joined)))
+        if len(clips) == 1:
+            list_file = work_dir / "concat.txt"
+            list_file.write_text(
+                ffmpeg.build_concat_list([str(clips[0])]), encoding="utf-8"
+            )
+            ffmpeg.run(ffmpeg.build_concat_cmd(str(list_file), str(joined)))
+        else:
+            ffmpeg.run(ffmpeg.build_crossfade_cmd(
+                [str(c) for c in clips],
+                [max(1, int(s["duration"])) for s in scenes],
+                str(joined),
+            ))
         if on_progress:
             on_progress(90)
 

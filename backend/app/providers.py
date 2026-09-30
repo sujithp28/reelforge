@@ -82,6 +82,7 @@ class MockGenerator:
             cmd = build_still_clip_cmd(
                 image=str(image), out=str(out), seconds=spec.seconds,
                 width=spec.width, height=spec.height, caption=spec.caption,
+                index=spec.index,
             )
         else:
             log.info("scene %s ffmpeg card image=%s", spec.scene_id, image or "none")

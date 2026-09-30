@@ -133,7 +133,32 @@ def test_still_clip_command_is_wellformed():
     assert "scale=1080:1920" in vf and "drawtext" in vf and "crop=w=" in vf
     # zoompan holds the first step on a still, so the move is an animated crop.
     assert "zoompan" not in vf, vf
-    assert f"-t" in cmd
+    assert "force_original_aspect_ratio=increase" in vf
+    assert "-t" in cmd
+
+
+def test_still_motion_follows_the_scene_index():
+    filters = []
+    for index, size in ((0, (1080, 1920)), (1, (1920, 1080)), (2, (1080, 1080)), (3, (1080, 1350)), (4, (1080, 1920))):
+        width, height = size
+        cmd = ffmpeg.build_still_clip_cmd(
+            image="in.jpg", out="out.mp4", seconds=6,
+            width=width, height=height, caption=None, index=index,
+        )
+        vf = cmd[cmd.index("-vf") + 1]
+        assert f"scale={width}:{height}:flags=lanczos" in vf
+        filters.append(vf)
+    assert len(set(filters)) == 5, "each scene index must take a different path"
+
+
+def test_crossfade_command_dissolves_without_a_dip_to_black():
+    cmd = ffmpeg.build_crossfade_cmd(["a.mp4", "b.mp4", "c.mp4"], [6, 7, 5], "out.mp4")
+    graph = cmd[cmd.index("-filter_complex") + 1]
+    assert graph.count("xfade=transition=fade:") == 2
+    assert "fadeblack" not in graph
+    assert "tpad=" in graph
+    assert cmd[cmd.index("-frames:v") + 1] == str(18 * ffmpeg.FPS)
+    assert cmd[cmd.index("-r") + 1] == str(ffmpeg.FPS)
 
 
 def test_card_clip_command_has_no_input_file():
@@ -228,6 +253,84 @@ def test_concat_file_escapes_quotes():
     body = ffmpeg.build_concat_list(["a b.mp4", "it's.mp4"])
     assert "'a b.mp4'" in body
     assert "it'\\''s.mp4" in body or "it\\'s.mp4" in body, body
+
+
+def test_crossfade_keeps_duration_fps_ratio_and_each_image():
+    """A dissolve between stills must not shorten the reel or mix up the photos."""
+    if not ffmpeg.ffmpeg_available():
+        print("  (skipped crossfade reel: ffmpeg not on PATH)")
+        return
+
+    from app import render
+    from app.providers import MockGenerator
+
+    root = Path(tempfile.mkdtemp(prefix="reelforge-fade-"))
+    try:
+        colors = ("0xE23B2F", "0x1D4ED8", "0x16A34A")
+        images: dict[str, Path] = {}
+        scenes = []
+        for index, color in enumerate(colors):
+            still = root / f"room-{index}.jpg"
+            ffmpeg.run([
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "lavfi", "-i", f"color=c={color}:s=1280x720",
+                "-frames:v", "1", str(still),
+            ])
+            scene_id = f"s{index}"
+            images[scene_id] = still
+            scenes.append({
+                "id": scene_id, "title": f"Room {index}", "prompt": "p",
+                "duration": 2, "caption": None,
+            })
+        out = root / "reel.mp4"
+        render.render_reel(
+            scenes=scenes, images=images, aspect_ratio="9:16",
+            work_dir=root / "work", out_path=out, generator=MockGenerator(),
+        )
+        duration = ffmpeg.probe_duration(str(out))
+        assert duration is not None and abs(duration - 6) < 0.02, duration
+        info = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,r_frame_rate",
+             "-of", "csv=p=0", str(out)],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        assert info == "1080,1920,30/1", info
+        red = _rgb(out, 0.4, "120:120:80:80")
+        blue = _rgb(out, 2.4, "120:120:80:80")
+        green = _rgb(out, 4.4, "120:120:80:80")
+        assert red[0] > 140 and red[0] > red[2] + 40, red
+        assert blue[2] > 140 and blue[2] > blue[0] + 40, blue
+        assert green[1] > 100 and green[1] > green[0] + 40, green
+        # The join at 2.0s is the middle of the dissolve, so both rooms show.
+        mix = _rgb(out, 2.0, "120:120:80:80")
+        assert mix[0] > 50 and mix[2] > 50, mix
+        assert abs(mix[0] - red[0]) > 40 and abs(mix[2] - blue[2]) > 40, mix
+        assert sum(mix) > 80, mix
+
+        wide_scenes = [
+            {"id": "w0", "title": "A", "prompt": "p", "duration": 2, "caption": None},
+            {"id": "w1", "title": "B", "prompt": "p", "duration": 2, "caption": None},
+        ]
+        wide_images = {"w0": images["s0"], "w1": images["s1"]}
+        for ratio, expect in (("16:9", "1920,1080,30/1"), ("1:1", "1080,1080,30/1"), ("4:5", "1080,1350,30/1")):
+            wide = root / f"{ratio.replace(':', 'x')}.mp4"
+            render.render_reel(
+                scenes=wide_scenes, images=wide_images, aspect_ratio=ratio,
+                work_dir=root / f"work-{ratio.replace(':', 'x')}", out_path=wide,
+                generator=MockGenerator(),
+            )
+            wide_duration = ffmpeg.probe_duration(str(wide))
+            assert wide_duration is not None and abs(wide_duration - 4) < 0.02, (ratio, wide_duration)
+            wide_info = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height,r_frame_rate",
+                 "-of", "csv=p=0", str(wide)],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+            assert wide_info == expect, (ratio, wide_info)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def _rgb(video: Path, at: float, crop: str) -> tuple[float, float, float]:
