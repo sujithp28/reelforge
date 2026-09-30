@@ -737,22 +737,22 @@ def test_retry_reuses_the_providers_of_the_last_render():
         print("  (skipped: ffmpeg not on PATH)")
         return
     project = make_project()
-    # Render explicitly with kaggle even though the server default is mock.
-    started = client.post(f"/api/projects/{project['id']}/render",
-                          json={"provider": "kaggle"})
-    assert started.status_code == 202, started.text
-    assert started.json()["provider"] == "kaggle"
-
-    # The job runner is "external" in these tests, so the render never
-    # finishes on its own. Release it so retry is not simply refused with 409.
+    # The customer API no longer accepts a provider. Seed the previous job
+    # the way a server-side render would, with a provider other than the
+    # default, and confirm retry keeps that provider.
     with db.connect() as conn:
+        repo.create_job(conn, project["id"], "kaggle")
         repo.mark_ready(conn, project["id"], "renders/fake.mp4")
 
     retried = client.post(
         f"/api/projects/{project['id']}/scenes/{project['scenes'][0]['id']}/retry"
     )
     assert retried.status_code == 202, retried.text
-    assert retried.json()["provider"] == "kaggle", (
+    assert "kaggle" not in retried.text.lower()
+    assert "provider" not in retried.json()
+    with db.connect() as conn:
+        stored = repo.get_job(conn, retried.json()["job_id"])
+    assert stored["provider"] == "kaggle", (
         "retry fell back to the server default and would rebuild every scene"
     )
     assert config.VIDEO_PROVIDER == "mock", "the default really is different"

@@ -280,14 +280,18 @@ def test_render_enqueues_a_job_without_running_it():
     assert res.status_code == 202, res.text
     body = res.json()
     assert body["status"] == "rendering"
-    assert body["provider"] == "mock"
+    assert "provider" not in body
     job_id = body["job_id"]
 
     # The runner is external, so the job stays queued and the request returned
     # immediately — that is the separation this is checking.
     job = client.get(f"/api/projects/{project['id']}/jobs/{job_id}").json()
     assert job["status"] == "queued"
-    assert job["provider"] == "mock"
+    assert "provider" not in job
+    from app import db, repo
+    with db.connect() as conn:
+        stored = repo.get_job(conn, job_id)
+    assert stored["provider"] == "mock"
 
     # A second render must not start while one is in flight.
     assert client.post(
@@ -299,25 +303,100 @@ def test_render_enqueues_a_job_without_running_it():
     ).status_code == 404
 
 
-def test_render_rejects_an_unconfigured_provider():
+def test_client_cannot_override_the_configured_provider():
+    """A customer body cannot select a provider, and errors name none."""
     if not ffmpeg.ffmpeg_available():
-        print("  (skipped provider rejection test: ffmpeg not on PATH)")
+        print("  (skipped provider override test: ffmpeg not on PATH)")
         return
-    project = make_project()
-    # LTX is a declared integration boundary with no endpoint configured.
-    res = client.post(f"/api/projects/{project['id']}/render", json={"provider": "ltx"})
-    assert res.status_code == 503, res.text
-    assert "ltx" in res.json()["detail"]
-    # A rejected render must leave the project alone.
-    assert client.get(f"/api/projects/{project['id']}").json()["status"] == "draft"
+    from app import db, repo
 
-    bad = client.post(
-        f"/api/projects/{project['id']}/render", json={"provider": "nope"}
+    project = make_project()
+    res = client.post(
+        f"/api/projects/{project['id']}/render", json={"provider": "wan"}
     )
-    assert bad.status_code == 422, bad.text
+    assert res.status_code == 202, res.text
+    lowered = res.text.lower()
+    for leak in ("wan", "kaggle", "ltx", "mock"):
+        assert leak not in lowered, leak
+    assert "provider" not in res.json()
+    with db.connect() as conn:
+        stored = repo.get_job(conn, res.json()["job_id"])
+    assert stored["provider"] == config.VIDEO_PROVIDER == "mock"
+    project_body = client.get(f"/api/projects/{project['id']}").json()
+    assert "provider" not in project_body["job"]
+
+    # Even an unknown name is ignored. The server setting still wins.
+    other = make_project()
+    ignored = client.post(
+        f"/api/projects/{other['id']}/render", json={"provider": "nope"}
+    )
+    assert ignored.status_code == 202, ignored.text
+    with db.connect() as conn:
+        stored = repo.get_job(conn, ignored.json()["job_id"])
+    assert stored["provider"] == "mock"
+
+    saved_provider = config.VIDEO_PROVIDER
+    saved_key = config.LTX_API_KEY
+    config.VIDEO_PROVIDER = "ltx"
+    config.LTX_API_KEY = ""
+    try:
+        blocked = make_project()
+        denied = client.post(
+            f"/api/projects/{blocked['id']}/render", json={"provider": "wan"}
+        )
+        assert denied.status_code == 503, denied.text
+        detail = denied.json()["detail"].lower()
+        for leak in ("wan", "kaggle", "ltx", "mock"):
+            assert leak not in detail, detail
+        assert "couldn't be generated" in detail
+        assert client.get(f"/api/projects/{blocked['id']}").json()["status"] == "draft"
+    finally:
+        config.VIDEO_PROVIDER = saved_provider
+        config.LTX_API_KEY = saved_key
 
 
 # --- deletion ---------------------------------------------------------------
+
+def test_media_hides_the_database_and_still_serves_public_files():
+    database = config.DATA_DIR / "reelforge.db"
+    assert database.exists()
+    hidden = client.get("/media/reelforge.db")
+    assert hidden.status_code == 404
+    assert b"SQLite format" not in hidden.content
+
+    work = config.DATA_DIR / "work"
+    work.mkdir(exist_ok=True)
+    (work / "secret.txt").write_text("not-public", encoding="utf-8")
+    assert client.get("/media/work/secret.txt").status_code == 404
+
+    staging = config.DATA_DIR / "kaggle"
+    staging.mkdir(exist_ok=True)
+    (staging / "job.mp4").write_bytes(b"not-a-reel")
+    assert client.get("/media/kaggle/job.mp4").status_code == 404
+
+    project = make_project()
+    uploaded = client.post(
+        f"/api/projects/{project['id']}/uploads",
+        files={"file": ("ref.png", PNG_1PX, "image/png")},
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    image = next(a for a in uploaded.json()["assets"] if a["kind"] == "image")
+    preview = client.get(image["url"])
+    assert preview.status_code == 200, image["url"]
+    assert preview.content == PNG_1PX
+
+    renders = config.DATA_DIR / "renders"
+    renders.mkdir(exist_ok=True)
+    (renders / "sample.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42fake")
+    download = client.get("/media/renders/sample.mp4")
+    assert download.status_code == 200
+    assert download.content.startswith(b"\x00\x00\x00\x18ftyp")
+
+    clips = config.DATA_DIR / "clips" / "proj"
+    clips.mkdir(parents=True, exist_ok=True)
+    (clips / "scene.mp4").write_bytes(b"clip-bytes")
+    assert client.get("/media/clips/proj/scene.mp4").content == b"clip-bytes"
+
 
 def test_delete_removes_project_and_assets():
     project = make_project()
@@ -588,6 +667,8 @@ def test_music_mux_command_uses_the_audio_settings():
     af = cmd[cmd.index("-af") + 1]
     assert "volume=0.250" in af, af
     assert "afade=t=out:st=27:d=3" in af, af
+    assert af.endswith("apad"), af
+    assert "-shortest" in cmd
     assert cmd[cmd.index("-c:v") + 1] == "copy", "video must not be re-encoded"
 
     # A fade longer than the reel would produce a negative start time.

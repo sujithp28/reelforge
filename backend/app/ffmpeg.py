@@ -158,10 +158,16 @@ def build_music_mux_cmd(
     video: str, music: str, out: str, total_seconds: int,
     volume: float = 0.8, fade_out: int = 2,
 ) -> list[str]:
-    """Lay a soundtrack over finished video without re-encoding the video."""
+    """Lay a soundtrack over finished video without re-encoding the video.
+
+    `apad` extends a short track with silence. `-shortest` then ends the file
+    when the video ends, so a long track is trimmed and a short one cannot
+    shrink the reel. Volume and the end fade stay on the video's timeline.
+    """
     filters = [f"volume={max(0.0, min(volume, 2.0)):.3f}"]
     if fade_out > 0 and total_seconds > fade_out:
         filters.append(f"afade=t=out:st={total_seconds - fade_out}:d={fade_out}")
+    filters.append("apad")
     return [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", video, "-i", music,

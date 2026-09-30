@@ -20,13 +20,13 @@ export default function Home() {
       <section className="mx-auto max-w-7xl px-6 pb-20 pt-20">
         <div className="max-w-3xl">
           <div className="mb-6 inline-flex items-center gap-2 rounded-full border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-300">
-            <Sparkles size={14} className="text-violet-400" /> AI reel creation, simplified
+            <Sparkles size={14} className="text-violet-400" /> Reel creation, simplified
           </div>
           <h1 className="text-6xl font-semibold leading-[1.02] tracking-tight md:text-7xl">
             Your idea.<br /><span className="text-zinc-500">Your scenes.</span><br />Your reel.
           </h1>
           <p className="mt-7 max-w-2xl text-lg leading-8 text-zinc-400">
-            Turn an idea, photo, product or person into a beautiful AI reel — with scenes, captions, voice and music.
+            Turn an idea, photo, product or person into a reel — with scenes, captions and music.
           </p>
           <div className="mt-9 flex gap-3">
             <Link href="/create" className="inline-flex items-center gap-2 rounded-xl bg-violet-500 px-6 py-3.5 font-semibold text-white hover:bg-violet-400">

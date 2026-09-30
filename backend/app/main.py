@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from . import (
     config, db, ffmpeg, jobs, kaggle, providers, repo, storage, storyboard,
 )
+from .render import CUSTOMER_RENDER_ERROR
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("reelforge")
@@ -61,15 +62,19 @@ if _released:
 if _recovered["requeued"] or _recovered["failed"]:
     log.warning("recovered stale scene jobs: %s", _recovered)
 
-# Local storage is served by the app. With REELFORGE_STORAGE=s3 the keys are
-# identical and url_for returns absolute URLs instead, so this mount becomes
-# unnecessary rather than wrong.
+# Serve only the files a customer is meant to see. The database, work
+# directories, and worker staging live in DATA_DIR too, and must not be
+# reachable as /media/<name>.
+PUBLIC_MEDIA_DIRS = ("uploads", "renders", "clips")
 if config.STORAGE_BACKEND == "local":
-    app.mount(
-        config.MEDIA_URL_PREFIX,
-        StaticFiles(directory=config.DATA_DIR),
-        name="media",
-    )
+    for _folder in PUBLIC_MEDIA_DIRS:
+        _directory = config.DATA_DIR / _folder
+        _directory.mkdir(parents=True, exist_ok=True)
+        app.mount(
+            f"{config.MEDIA_URL_PREFIX}/{_folder}",
+            StaticFiles(directory=_directory),
+            name=f"media-{_folder}",
+        )
 
 ALLOWED_RATIOS = set(storyboard.ASPECT_SIZES)
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -151,15 +156,12 @@ def _require_available_provider(name: str):
     try:
         generator = providers.build_generator(name)
     except ffmpeg.RenderError as exc:
-        raise HTTPException(422, str(exc)) from exc
+        log.warning("provider refused: %s", exc)
+        raise HTTPException(503, CUSTOMER_RENDER_ERROR) from exc
     if not generator.available():
         reason = providers.configuration_error(generator.name)
         log.warning("provider %s unavailable: %s", generator.name, reason)
-        raise HTTPException(
-            503,
-            f"the {generator.name!r} video provider is not configured."
-            " Use provider 'mock' to render locally.",
-        )
+        raise HTTPException(503, CUSTOMER_RENDER_ERROR)
     return generator
 
 
@@ -191,7 +193,7 @@ def _serialize(conn, project: dict) -> dict:
     out["video_url"] = storage.storage.url_for(out.pop("video_key", None))
     job = repo.latest_job(conn, project["id"])
     out["job"] = (
-        {"id": job["id"], "status": job["status"], "provider": job["provider"]}
+        {"id": job["id"], "status": job["status"]}
         if job else None
     )
     return out
@@ -468,8 +470,15 @@ def start_render(project_id: str, request: RenderRequest | None = None):
     if not ffmpeg.ffmpeg_available():
         raise HTTPException(503, "ffmpeg is not installed or not on PATH")
 
-    name = (request.provider if request else None) or config.VIDEO_PROVIDER
-    generator = _require_available_provider(name)
+    # The browser cannot choose a provider. A body field is ignored so a
+    # customer request cannot target another backend.
+    requested = request.provider if request else None
+    if requested and requested != config.VIDEO_PROVIDER:
+        log.info(
+            "ignoring requested provider %r; using server provider %s",
+            requested, config.VIDEO_PROVIDER,
+        )
+    generator = _require_available_provider(config.VIDEO_PROVIDER)
 
     with db.connect() as conn:
         _require_project(conn, project_id)
@@ -482,7 +491,7 @@ def start_render(project_id: str, request: RenderRequest | None = None):
     jobs.submit(job_id, project_id)
     return {
         "id": project_id, "job_id": job_id, "status": "rendering",
-        "progress": 0, "provider": generator.name,
+        "progress": 0,
     }
 
 
@@ -520,7 +529,7 @@ def retry_scene(project_id: str, scene_id: str):
     jobs.submit(job_id, project_id)
     return {
         "id": project_id, "job_id": job_id, "scene_id": scene_id,
-        "status": "rendering", "progress": 0, "provider": generator.name,
+        "status": "rendering", "progress": 0,
     }
 
 
@@ -799,4 +808,6 @@ def get_job(project_id: str, job_id: str):
         job = repo.get_job(conn, job_id)
         if job is None or job["project_id"] != project_id:
             raise HTTPException(404, "job not found")
+        # Stored for the worker. Not part of the customer payload.
+        job.pop("provider", None)
         return job

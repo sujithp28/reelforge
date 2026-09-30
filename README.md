@@ -31,6 +31,12 @@ python -m pip install -r requirements.txt
 python -m uvicorn app.main:app --reload --port 8000
 ```
 
+`--reload` is for local development. A production process omits it:
+
+```powershell
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
 Health check: http://localhost:8000/health — it reports whether FFmpeg was found.
 
 State lives in `backend/data/` (SQLite database, uploads, renders). It is

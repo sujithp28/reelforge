@@ -15,8 +15,8 @@ export const DURATIONS = [15, 30, 45, 60] as const;
 
 /** Customer-facing quality. Maps to provider/model settings on the backend. */
 export const QUALITIES = [
-  { value: "standard", label: "Standard", hint: "Faster to generate" },
-  { value: "high", label: "High", hint: "Higher fidelity, slower" },
+  { value: "standard", label: "Standard", hint: "Motion from your images" },
+  { value: "high", label: "High", hint: "Motion from your images" },
 ] as const;
 
 export type Quality = (typeof QUALITIES)[number]["value"];
@@ -70,7 +70,6 @@ export type Project = {
   job: {
     id: string;
     status: string;
-    provider: string;
   } | null;
 };
 
@@ -207,10 +206,9 @@ export const api = {
       body: JSON.stringify(settings),
     }),
 
-  /** `provider` defaults to the backend's configured generator (mock locally). */
-  render: (projectId: string, provider?: string) =>
-    request<{ id: string; job_id: string; status: string; provider: string }>(
+  render: (projectId: string) =>
+    request<{ id: string; job_id: string; status: string }>(
       `/api/projects/${projectId}/render`,
-      { method: "POST", body: JSON.stringify({ provider: provider ?? null }) },
+      { method: "POST", body: JSON.stringify({}) },
     ),
 };

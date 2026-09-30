@@ -14,10 +14,18 @@ storage — the hooks do, which keeps the layering one-way.
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Protocol
+
+log = logging.getLogger("reelforge.render")
+
+# Shown to customers. Names no provider, host, or file path.
+CUSTOMER_RENDER_ERROR = (
+    "Your reel couldn't be generated right now. Please try again."
+)
 
 from . import ffmpeg
 from .ffmpeg import RenderError
@@ -161,10 +169,8 @@ def render_reel(
     if not scenes:
         raise RenderError("nothing to render: this project has no scenes")
     if not generator.available():
-        raise RenderError(
-            f"the {generator.name!r} video provider is not available;"
-            " check its configuration"
-        )
+        log.warning("provider %s is not available", generator.name)
+        raise RenderError(CUSTOMER_RENDER_ERROR)
 
     hooks = hooks or NoHooks()
     width, height = resolution_for(aspect_ratio)
@@ -196,9 +202,11 @@ def render_reel(
             try:
                 generator.generate(spec, clip)
                 if not clip.exists() or clip.stat().st_size == 0:
-                    raise RenderError(
-                        f"the {generator.name!r} provider produced no clip"
+                    log.warning(
+                        "provider %s produced no clip for scene %s",
+                        generator.name, spec.scene_id,
                     )
+                    raise RenderError(CUSTOMER_RENDER_ERROR)
             except RenderError as exc:
                 elapsed = int((time.monotonic() - started) * 1000)
                 message = str(exc)

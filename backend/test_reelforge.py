@@ -3,6 +3,10 @@ building. Plain asserts, no test framework.
 
     python test_reelforge.py
 """
+import shutil
+import tempfile
+from pathlib import Path
+
 from app import ffmpeg, storyboard
 
 
@@ -126,6 +130,86 @@ def test_card_clip_command_has_no_input_file():
     )
     assert "lavfi" in cmd
     assert cmd[-1] == "out.mp4"
+
+
+def _media(path: Path, seconds: int, audio: bool) -> None:
+    if audio:
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+            "-t", str(seconds), str(path),
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "lavfi", "-i", f"color=c=black:s=320x180:d={seconds}:r=30",
+            "-t", str(seconds), str(path),
+        ]
+    ffmpeg.run(cmd)
+
+
+def test_soundtrack_length_cannot_change_the_reel():
+    """30s picture stays 30s with a short track, a long track, or no track."""
+    if not ffmpeg.ffmpeg_available():
+        print("  (skipped soundtrack duration: ffmpeg not on PATH)")
+        return
+    root = Path(tempfile.mkdtemp(prefix="reelforge-mux-"))
+    try:
+        video = root / "video.mp4"
+        short = root / "short.wav"
+        long = root / "long.wav"
+        _media(video, 30, audio=False)
+        _media(short, 12, audio=True)
+        _media(long, 45, audio=True)
+        cases = (("short", short), ("long", long), ("none", None))
+        for name, music in cases:
+            out = root / f"{name}.mp4"
+            if music is None:
+                ffmpeg.run(ffmpeg.build_finalize_cmd(str(video), str(out)))
+            else:
+                ffmpeg.run(ffmpeg.build_music_mux_cmd(
+                    str(video), str(music), str(out),
+                    total_seconds=30, volume=0.8, fade_out=2,
+                ))
+            duration = ffmpeg.probe_duration(str(out))
+            assert duration is not None and abs(duration - 30) < 0.15, (name, duration)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_unavailable_provider_message_names_nothing():
+    if not ffmpeg.ffmpeg_available():
+        print("  (skipped provider message: ffmpeg not on PATH)")
+        return
+    from app import render
+
+    class Hidden:
+        name = "wan"
+
+        def available(self) -> bool:
+            return False
+
+        def generate(self, spec, out) -> None:
+            raise AssertionError("unavailable provider was asked to generate")
+
+    root = Path(tempfile.mkdtemp(prefix="reelforge-hidden-"))
+    try:
+        render.render_reel(
+            scenes=[{"id": "s", "title": "Opening", "prompt": "p", "duration": 2,
+                     "caption": None}],
+            images={}, aspect_ratio="9:16",
+            work_dir=root / "work", out_path=root / "out.mp4",
+            generator=Hidden(),
+        )
+    except render.RenderError as exc:
+        text = str(exc).lower()
+        for leak in ("wan", "kaggle", "ltx", "mock"):
+            assert leak not in text, text
+        assert "couldn't be generated" in text
+    else:
+        raise AssertionError("an unavailable provider was allowed to render")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_concat_file_escapes_quotes():
