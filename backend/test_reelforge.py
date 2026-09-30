@@ -353,6 +353,210 @@ def test_browser_create_upload_render_puts_the_image_in_the_mp4():
         cursor += scene["duration"]
 
 
+def test_product_image_source_upload_is_on_every_scene():
+    """Customer path: category Product, source Image, then the photo.
+
+    The create body is JSON and has no file. The photo is the next request,
+    with no scene id, and every scene must show that image. Title-card pixels
+    are a failure.
+    """
+    if not ffmpeg.ffmpeg_available():
+        print("  (skipped product image flow: ffmpeg not on PATH)")
+        return
+
+    from fastapi.testclient import TestClient
+
+    from app import jobs
+    from app.main import app
+
+    root = _IMAGE_REEL_ROOT
+    client = TestClient(app)
+    created = client.post("/api/projects", json={
+        "idea": "a teal bottle on a white table",
+        "category": "Product",
+        "input_type": "Image",
+        "duration": 6,
+        "aspect_ratio": "9:16",
+    })
+    assert created.status_code == 201, created.text
+    project = created.json()
+    assert project["input_type"] == "Image"
+    assert project["category"] == "Product"
+    assert all(s["asset_url"] is None for s in project["scenes"])
+
+    still = root / "product-bottle.jpg"
+    ffmpeg.run([
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-f", "lavfi", "-i", "color=c=0x0F766E:s=1280x720",
+        "-frames:v", "1", str(still),
+    ])
+    uploaded = client.post(
+        f"/api/projects/{project['id']}/uploads",
+        files={"file": ("product-bottle.jpg", still.read_bytes(), "image/jpeg")},
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    body = uploaded.json()
+    asset_ids = {a["id"] for a in body["assets"] if a["kind"] == "image"}
+    assert len(asset_ids) == 1
+    assert all(s["asset_id"] in asset_ids and s["asset_url"] for s in body["scenes"])
+
+    started = client.post(f"/api/projects/{project['id']}/render", json={})
+    assert started.status_code == 202, started.text
+    jobs._execute(started.json()["job_id"], project["id"])
+
+    done = client.get(f"/api/projects/{project['id']}").json()
+    assert done["status"] == "ready", done.get("error")
+    video = root / done["video_url"].split("/media/", 1)[1]
+    cursor = 0.4
+    for scene in body["scenes"]:
+        pixel = _rgb(video, cursor, "120:120:80:80")
+        assert pixel[1] > 80 and pixel[1] > pixel[0] + 40, (scene["title"], pixel)
+        for color in ffmpeg.CARD_COLORS:
+            card = _hex_rgb(color)
+            distance = sum(abs(pixel[i] - card[i]) for i in range(3))
+            assert distance > 80, (scene["title"], pixel, color)
+        cursor += scene["duration"]
+
+
+def test_four_scene_images_are_different_frames_in_the_mp4():
+    """Four photos on a 30s cinematic reel. The last photo also closes the reel.
+
+    Scene clips and the finished MP4 are both sampled. Database asset ids are
+    not enough: the pixels at 1s, 8s, 14s, 20s and 26s have to change with the
+    assigned photo.
+    """
+    if not ffmpeg.ffmpeg_available():
+        print("  (skipped multi-image reel: ffmpeg not on PATH)")
+        return
+
+    from fastapi.testclient import TestClient
+
+    from app import jobs
+    from app.main import app
+
+    rooms = [
+        ("Living Room", "0xE23B2F", lambda p: p[0] > 140 and p[0] > p[1] + 40 and p[0] > p[2] + 40),
+        ("Dining Area", "0x1D4ED8", lambda p: p[2] > 140 and p[2] > p[0] + 40),
+        ("Modular Kitchen", "0x16A34A", lambda p: p[1] > 100 and p[1] > p[0] + 40 and p[1] > p[2] + 20),
+        ("Master Bedroom", "0xF59E0B", lambda p: p[0] > 160 and p[1] > 100 and p[2] < 80),
+    ]
+    # Opening, Main moment, Detail, Story beat, Closing. The fourth photo repeats.
+    assignment = [0, 1, 2, 3, 3]
+    samples = [1.0, 8.0, 14.0, 20.0, 26.0]
+
+    root = _IMAGE_REEL_ROOT
+    client = TestClient(app)
+    created = client.post("/api/projects", json={
+        "idea": "a house shown room by room",
+        "category": "Cinematic",
+        "input_type": "Image",
+        "duration": 30,
+        "aspect_ratio": "9:16",
+    })
+    assert created.status_code == 201, created.text
+    project = created.json()
+    scenes = project["scenes"]
+    assert [s["title"] for s in scenes] == [
+        "Opening", "Main moment", "Detail", "Story beat", "Closing",
+    ]
+    assert [s["duration"] for s in scenes] == [6, 7, 6, 6, 5]
+    assert sum(s["duration"] for s in scenes) == 30
+
+    asset_ids = []
+    for index, (name, color, _check) in enumerate(rooms):
+        still = root / f"{name}.jpg"
+        ffmpeg.run([
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "lavfi", "-i", f"color=c={color}:s=1280x720",
+            "-frames:v", "1", str(still),
+        ])
+        uploaded = client.post(
+            f"/api/projects/{project['id']}/uploads",
+            params={"scene_id": scenes[index]["id"]},
+            files={"file": (f"{name}.jpg", still.read_bytes(), "image/jpeg")},
+        )
+        assert uploaded.status_code == 201, uploaded.text
+        asset_ids.append(next(
+            s["asset_id"] for s in uploaded.json()["scenes"] if s["id"] == scenes[index]["id"]
+        ))
+
+    closing = client.put(
+        f"/api/projects/{project['id']}/scenes/{scenes[4]['id']}/asset",
+        json={"asset_id": asset_ids[3]},
+    )
+    assert closing.status_code == 200, closing.text
+    mapped = [s["asset_id"] for s in closing.json()["scenes"]]
+    assert mapped == [asset_ids[i] for i in assignment]
+    assert len({a["id"] for a in closing.json()["assets"] if a["kind"] == "image"}) == 4
+
+    # Switching Opening onto the kitchen photo must not move the other scenes.
+    switched = client.put(
+        f"/api/projects/{project['id']}/scenes/{scenes[0]['id']}/asset",
+        json={"asset_id": asset_ids[2]},
+    )
+    assert switched.status_code == 200, switched.text
+    after = [s["asset_id"] for s in switched.json()["scenes"]]
+    assert after == [asset_ids[2], asset_ids[1], asset_ids[2], asset_ids[3], asset_ids[3]]
+    restored = client.put(
+        f"/api/projects/{project['id']}/scenes/{scenes[0]['id']}/asset",
+        json={"asset_id": asset_ids[0]},
+    )
+    assert [s["asset_id"] for s in restored.json()["scenes"]] == [asset_ids[i] for i in assignment]
+
+    started = client.post(f"/api/projects/{project['id']}/render", json={})
+    assert started.status_code == 202, started.text
+    jobs._execute(started.json()["job_id"], project["id"])
+
+    done = client.get(f"/api/projects/{project['id']}").json()
+    assert done["status"] == "ready", done.get("error")
+    assert done["total_duration"] == 30
+    video = root / done["video_url"].split("/media/", 1)[1]
+    duration = ffmpeg.probe_duration(str(video))
+    assert duration is not None and abs(duration - 30) < 0.05, duration
+    info = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height,r_frame_rate",
+         "-of", "csv=p=0", str(video)],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert info == "1080,1920,30/1", info
+
+    clip_dir = root / "clips" / project["id"]
+    for scene, room_index in zip(scenes, assignment):
+        clips = list(clip_dir.glob(f"{scene['id']}_*.mp4"))
+        assert len(clips) == 1, (scene["title"], clips)
+        pixel = _rgb(clips[0], 0.4, "120:120:80:80")
+        name, _color, check = rooms[room_index]
+        print(f"  clip {scene['title']} {name} rgb={tuple(round(c) for c in pixel)}")
+        assert check(pixel), (scene["title"], name, pixel)
+        for color in ffmpeg.CARD_COLORS:
+            card = _hex_rgb(color)
+            distance = sum(abs(pixel[i] - card[i]) for i in range(3))
+            assert distance > 80, (scene["title"], pixel, color)
+
+    seen = []
+    for at, room_index in zip(samples, assignment):
+        pixel = _rgb(video, at, "120:120:80:80")
+        name, _color, check = rooms[room_index]
+        print(f"  frame {at:.0f}s {name} rgb={tuple(round(c) for c in pixel)}")
+        assert check(pixel), (at, name, pixel)
+        seen.append(pixel)
+        for color in ffmpeg.CARD_COLORS:
+            card = _hex_rgb(color)
+            distance = sum(abs(pixel[i] - card[i]) for i in range(3))
+            assert distance > 80, (at, pixel, color)
+    # Neighbouring rooms are different photos. The last two samples are the same bedroom.
+    for earlier, later in ((0, 1), (1, 2), (2, 3)):
+        gap = sum(abs(seen[earlier][i] - seen[later][i]) for i in range(3))
+        assert gap > 80, (samples[earlier], samples[later], gap)
+    same = sum(abs(seen[3][i] - seen[4][i]) for i in range(3))
+    assert same < 40, (seen[3], seen[4])
+    print(
+        f"  multi-image mp4 {video.name} {video.stat().st_size} bytes"
+        f" {duration:.3f}s {info}"
+    )
+
+
 def test_uploaded_image_is_in_the_reel_and_cards_remain_without_one():
     """Upload path: one scene with a still, one without, exact duration.
 

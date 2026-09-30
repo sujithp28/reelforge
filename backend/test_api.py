@@ -206,6 +206,106 @@ def test_upload_targets_one_scene_when_named():
     assert not scenes[project["scenes"][0]["id"]]["asset_url"]
 
 
+def test_four_images_assign_in_order_and_the_last_repeats():
+    """Four uploads on a five-scene reel stay on their scenes. The last image covers the close."""
+    project = make_project(category="Cinematic", duration=30, input_type="Image")
+    scenes = project["scenes"]
+    assert [s["title"] for s in scenes] == [
+        "Opening", "Main moment", "Detail", "Story beat", "Closing",
+    ]
+    assert sum(s["duration"] for s in scenes) == 30
+
+    asset_ids = []
+    body = None
+    for index, scene in enumerate(scenes[:4]):
+        res = client.post(
+            f"/api/projects/{project['id']}/uploads",
+            params={"scene_id": scene["id"]},
+            files={"file": (f"room-{index}.png", PNG_1PX, "image/png")},
+        )
+        assert res.status_code == 201, res.text
+        body = res.json()
+        asset_ids.append(next(s["asset_id"] for s in body["scenes"] if s["id"] == scene["id"]))
+
+    closing = next(s for s in body["scenes"] if s["id"] == scenes[4]["id"])
+    assert closing["asset_id"] is None, "a short image list must not invent a title card or copy the first photo"
+    assert {a["filename"] for a in body["assets"] if a["kind"] == "image"} == {
+        "room-0.png", "room-1.png", "room-2.png", "room-3.png",
+    }
+
+    assigned = client.put(
+        f"/api/projects/{project['id']}/scenes/{scenes[4]['id']}/asset",
+        json={"asset_id": asset_ids[3]},
+    )
+    assert assigned.status_code == 200, assigned.text
+    by_position = {s["position"]: s["asset_id"] for s in assigned.json()["scenes"]}
+    assert [by_position[i] for i in range(5)] == [
+        asset_ids[0], asset_ids[1], asset_ids[2], asset_ids[3], asset_ids[3],
+    ]
+    assert sum(s["duration"] for s in assigned.json()["scenes"]) == 30
+
+
+def test_changing_one_scene_image_leaves_the_others():
+    project = make_project(category="Cinematic", duration=30)
+    scenes = project["scenes"]
+    asset_ids = []
+    for index, scene in enumerate(scenes[:4]):
+        res = client.post(
+            f"/api/projects/{project['id']}/uploads",
+            params={"scene_id": scene["id"]},
+            files={"file": (f"room-{index}.png", PNG_1PX, "image/png")},
+        )
+        assert res.status_code == 201, res.text
+        asset_ids.append(next(
+            s["asset_id"] for s in res.json()["scenes"] if s["id"] == scene["id"]
+        ))
+    client.put(
+        f"/api/projects/{project['id']}/scenes/{scenes[4]['id']}/asset",
+        json={"asset_id": asset_ids[3]},
+    )
+
+    changed = client.put(
+        f"/api/projects/{project['id']}/scenes/{scenes[0]['id']}/asset",
+        json={"asset_id": asset_ids[2]},
+    )
+    assert changed.status_code == 200, changed.text
+    got = {s["id"]: s["asset_id"] for s in changed.json()["scenes"]}
+    assert got[scenes[0]["id"]] == asset_ids[2]
+    assert got[scenes[1]["id"]] == asset_ids[1]
+    assert got[scenes[2]["id"]] == asset_ids[2]
+    assert got[scenes[3]["id"]] == asset_ids[3]
+    assert got[scenes[4]["id"]] == asset_ids[3]
+
+
+def test_assign_scene_asset_rejects_a_missing_image():
+    project = make_project()
+    scene = project["scenes"][0]
+    missing = client.put(
+        f"/api/projects/{project['id']}/scenes/{scene['id']}/asset",
+        json={"asset_id": "asset_missing"},
+    )
+    assert missing.status_code == 404
+    unknown_scene = client.put(
+        f"/api/projects/{project['id']}/scenes/scene_nope/asset",
+        json={"asset_id": "asset_missing"},
+    )
+    assert unknown_scene.status_code == 404
+
+    other = make_project()
+    uploaded = client.post(
+        f"/api/projects/{other['id']}/uploads",
+        files={"file": ("ref.png", PNG_1PX, "image/png")},
+    )
+    foreign = uploaded.json()["assets"][0]["id"]
+    rejected = client.put(
+        f"/api/projects/{project['id']}/scenes/{scene['id']}/asset",
+        json={"asset_id": foreign},
+    )
+    assert rejected.status_code == 404
+    untouched = client.get(f"/api/projects/{project['id']}").json()
+    assert all(s["asset_id"] is None for s in untouched["scenes"])
+
+
 def test_upload_rejects_bad_files():
     project = make_project()
     url = f"/api/projects/{project['id']}/uploads"

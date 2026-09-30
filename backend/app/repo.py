@@ -386,6 +386,14 @@ def insert_asset(
     )
 
 
+def get_asset(conn: Any, project_id: str, asset_id: str) -> dict | None:
+    row = conn.execute(
+        db.sql("SELECT * FROM assets WHERE id = ? AND project_id = ?"),
+        (asset_id, project_id),
+    ).fetchone()
+    return dict(row) if row else None
+
+
 def list_assets(conn: Any, project_id: str) -> list[dict]:
     return rows_to_dicts(conn.execute(
         db.sql(

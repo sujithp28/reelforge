@@ -8,7 +8,7 @@ import {
   RefreshCw, RotateCcw, WandSparkles, X,
 } from "lucide-react";
 import {
-  api, mediaUrl, QUALITIES, type Project, type Quality, type Scene,
+  api, mediaUrl, QUALITIES, type Asset, type Project, type Quality, type Scene,
 } from "../../../lib/api";
 
 const RATIO_CLASS: Record<string, string> = {
@@ -87,19 +87,20 @@ export default function ProjectPage() {
         <Link href="/dashboard" className="mb-8 inline-flex items-center gap-2 text-sm text-zinc-400 hover:text-white"><ArrowLeft size={16}/> Dashboard</Link>
 
         {!project.scenes.some(scene => scene.asset_url) && (
-          <label className="relative mb-6 flex cursor-pointer items-center justify-center gap-2 rounded-2xl border border-dashed border-amber-700/80 bg-amber-950/30 p-4 text-sm text-amber-100">
+          <div className="relative mb-6 flex cursor-pointer items-center justify-center gap-2 rounded-2xl border border-dashed border-amber-700/80 bg-amber-950/30 p-4 text-sm text-amber-100">
             <ImagePlus size={16}/> Add a photo for every scene. Without one, the reel is title cards.
             <input
               type="file"
-              accept="image/jpeg,image/png,image/webp,image/bmp"
-              className="absolute inset-0 cursor-pointer opacity-0"
+              accept="image/jpeg,image/png,image/webp,image/bmp,image/*"
+              aria-label="Add a photo for every scene"
+              className="absolute inset-0 z-10 cursor-pointer opacity-0"
               onChange={e => {
                 const f = e.target.files?.[0];
                 if (f) void act("photo", () => api.upload(project.id, f));
                 e.target.value = "";
               }}
             />
-          </label>
+          </div>
         )}
 
         <header className="mb-8 flex flex-wrap items-end justify-between gap-4">
@@ -133,6 +134,8 @@ export default function ProjectPage() {
                 onRegenerate={() => act(`regen-${scene.id}`, () => api.regenerateScene(project.id, scene.id))}
                 onSave={patch => act(`save-${scene.id}`, () => api.updateScene(project.id, scene.id, patch))}
                 onUpload={file => act(`up-${scene.id}`, () => api.upload(project.id, file, scene.id))}
+                onAssign={assetId => act(`img-${scene.id}`, () => api.assignSceneAsset(project.id, scene.id, assetId))}
+                images={project.assets.filter(asset => asset.kind === "image")}
                 onRetry={() => act(`retry-${scene.id}`, () => api.retryScene(project.id, scene.id))}
                 canRetry={project.status !== "rendering"}
               />
@@ -316,14 +319,16 @@ function StatusPill({ project }: { project: Project }) {
 }
 
 function SceneCard({
-  scene, index, pending, onRegenerate, onSave, onUpload, onRetry, canRetry,
+  scene, index, pending, images, onRegenerate, onSave, onUpload, onAssign, onRetry, canRetry,
 }: {
   scene: Scene;
   index: number;
   pending: string | null;
+  images: Asset[];
   onRegenerate: () => void;
   onSave: (patch: Partial<Pick<Scene, "title" | "prompt" | "caption" | "duration">>) => void;
   onUpload: (file: File) => void;
+  onAssign: (assetId: string) => void;
   onRetry: () => void;
   canRetry: boolean;
 }) {
@@ -343,11 +348,11 @@ function SceneCard({
   }, [scene.title, scene.prompt, scene.caption, scene.duration]);
 
   const thumb = mediaUrl(scene.asset_url);
-  const busy = pending === `regen-${scene.id}` || pending === `save-${scene.id}` || pending === `up-${scene.id}`;
+  const busy = pending === `regen-${scene.id}` || pending === `save-${scene.id}` || pending === `up-${scene.id}` || pending === `img-${scene.id}`;
 
   return (
     <div className="grid gap-4 rounded-2xl border border-zinc-800 bg-zinc-900 p-5 md:grid-cols-[90px_1fr_auto] md:items-start">
-      <label
+      <div
         title="Replace this scene's still"
         className="group relative flex h-20 w-full cursor-pointer items-center justify-center overflow-hidden rounded-xl bg-zinc-800 text-2xl"
       >
@@ -368,7 +373,7 @@ function SceneCard({
             e.target.value = "";
           }}
         />
-      </label>
+      </div>
 
       {editing ? (
         <div className="space-y-3">
@@ -408,6 +413,28 @@ function SceneCard({
             </p>
           )}
           <p className="mt-2 text-sm leading-6 text-zinc-400">{scene.prompt}</p>
+          <label className="mt-3 flex flex-wrap items-center gap-2 text-xs text-zinc-500" htmlFor={`img-${scene.id}`}>
+            Change image
+            <select
+              id={`img-${scene.id}`}
+              aria-label={`Change image for ${scene.title}`}
+              value={scene.asset_id ?? ""}
+              disabled={busy || images.length === 0}
+              onChange={e => {
+                const next = e.target.value;
+                if (next && next !== scene.asset_id) onAssign(next);
+              }}
+              className="rounded-lg border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-sm text-zinc-200 outline-none focus:border-violet-500 disabled:opacity-50"
+            >
+              {images.length === 0 && <option value="">No photos yet</option>}
+              {images.length > 0 && !scene.asset_id && <option value="">Choose a photo</option>}
+              {images.map((asset, imageIndex) => (
+                <option key={asset.id} value={asset.id}>
+                  {asset.filename || `Photo ${imageIndex + 1}`}
+                </option>
+              ))}
+            </select>
+          </label>
         </div>
       )}
 

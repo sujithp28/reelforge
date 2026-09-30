@@ -165,6 +165,13 @@ export const api = {
       method: "POST",
     }),
 
+  /** Point one scene at an image already stored on this project. */
+  assignSceneAsset: (projectId: string, sceneId: string, assetId: string) =>
+    request<Project>(`/api/projects/${projectId}/scenes/${sceneId}/asset`, {
+      method: "PUT",
+      body: JSON.stringify({ asset_id: assetId }),
+    }),
+
   upload: (projectId: string, file: File, sceneId?: string) => {
     const form = new FormData();
     form.append("file", file);

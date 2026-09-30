@@ -105,6 +105,10 @@ class StoryboardRequest(BaseModel):
     aspect_ratio: str = "9:16"
 
 
+class SceneAssetRequest(BaseModel):
+    asset_id: str = Field(min_length=1, max_length=80)
+
+
 class SceneUpdate(BaseModel):
     title: str | None = Field(default=None, max_length=120)
     prompt: str | None = Field(default=None, max_length=2000)
@@ -130,6 +134,19 @@ class RenderRequest(BaseModel):
 
 
 # --- helpers ----------------------------------------------------------------
+
+def _upload_filename(original: str | None, suffix: str) -> str:
+    """Keep the customer's file name for the scene picker. The storage key stays an id."""
+    raw = Path(original or "").name
+    cleaned = "".join(
+        ch if ch.isalnum() or ch in " ._-()" else "_" for ch in raw
+    ).strip().strip(".")
+    if not cleaned:
+        cleaned = f"upload{suffix}"
+    if suffix and not cleaned.lower().endswith(suffix):
+        cleaned = f"{cleaned}{suffix}"
+    return cleaned[:120]
+
 
 def _check_ratio(ratio: str) -> str:
     if ratio not in ALLOWED_RATIOS:
@@ -399,6 +416,28 @@ def regenerate_scene(project_id: str, scene_id: str):
     return payload
 
 
+@app.put("/api/projects/{project_id}/scenes/{scene_id}/asset")
+def assign_scene_asset(project_id: str, scene_id: str, body: SceneAssetRequest):
+    """Point one scene at an image already uploaded for this project.
+
+    This does not copy the file. Other scenes keep the asset they already have.
+    """
+    with db.connect() as conn:
+        _require_project(conn, project_id)
+        if repo.get_scene(conn, project_id, scene_id) is None:
+            raise HTTPException(404, "scene not found")
+        asset = repo.get_asset(conn, project_id, body.asset_id)
+        if asset is None or asset["kind"] != "image":
+            raise HTTPException(404, "image not found")
+        repo.attach_asset_to_scene(conn, project_id, scene_id, body.asset_id)
+        stale = repo.clear_clip(conn, project_id, scene_id)
+        repo.invalidate_render(conn, project_id)
+        payload = _serialize(conn, _require_project(conn, project_id))
+    if stale:
+        storage.storage.delete_prefix(stale)
+    return payload
+
+
 # --- uploads ----------------------------------------------------------------
 
 @app.post("/api/projects/{project_id}/uploads", status_code=201)
@@ -445,7 +484,7 @@ async def upload_asset(
         key = storage.upload_key(project_id, asset_id, suffix)
         storage.storage.save_bytes(key, payload)
         repo.insert_asset(
-            conn, project_id, asset_id, kind, f"{asset_id}{suffix}", key
+            conn, project_id, asset_id, kind, _upload_filename(file.filename, suffix), key
         )
         stale: list[str] = []
         if kind == "image":
