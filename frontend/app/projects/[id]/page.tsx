@@ -18,6 +18,16 @@ const RATIO_CLASS: Record<string, string> = {
   "4:5": "aspect-[4/5]",
 };
 
+/** Saved name for the finished reel. The browser chooses the folder. */
+function reelDownloadName(title: string): string {
+  const name = title
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+  return `reelforge-${name || "reel"}.mp4`;
+}
+
 export default function ProjectPage() {
   const { id } = useParams<{ id: string }>();
   const [project, setProject] = useState<Project | null>(null);
@@ -80,6 +90,31 @@ export default function ProjectPage() {
 
   const videoUrl = mediaUrl(project.video_url);
   const music = project.assets.find(a => a.kind === "audio");
+  const downloadName = reelDownloadName(project.title);
+
+  async function downloadReel() {
+    if (!videoUrl) return;
+    setPending("download");
+    setError(null);
+    try {
+      const response = await fetch(videoUrl);
+      if (!response.ok) throw new Error("download failed");
+      const blob = await response.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = objectUrl;
+      link.download = downloadName;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      // Revoke after the browser has started the save. Immediate revoke can cancel it.
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1500);
+    } catch {
+      setError("The reel could not be downloaded. Please try again.");
+    } finally {
+      setPending(null);
+    }
+  }
 
   return (
     <main className="min-h-screen bg-zinc-950 px-6 py-8">
@@ -185,9 +220,15 @@ export default function ProjectPage() {
               )}
 
               {videoUrl && (
-                <a href={videoUrl} download={`${project.title.slice(0, 40)}.mp4`} className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl border border-zinc-800 px-5 py-3 text-sm font-semibold text-zinc-200 hover:bg-zinc-950">
-                  <Download size={16}/> Download MP4
-                </a>
+                <button
+                  type="button"
+                  onClick={() => void downloadReel()}
+                  disabled={pending === "download"}
+                  className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl border border-zinc-800 px-5 py-3 text-sm font-semibold text-zinc-200 hover:bg-zinc-950 disabled:opacity-50"
+                >
+                  {pending === "download" ? <Loader2 size={16} className="animate-spin"/> : <Download size={16}/>}
+                  Download MP4
+                </button>
               )}
 
               <div className="mt-5 border-t border-zinc-800 pt-5">

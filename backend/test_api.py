@@ -670,10 +670,15 @@ def test_clip_keys_are_not_exposed_to_the_browser():
     with db.connect() as conn:
         repo.set_clip_ready(conn, project["scenes"][0]["id"],
                             key="clips/secret/internal_path.mp4",
-                            clip_hash="h", provider="mock")
+                            clip_hash="hash-not-for-the-browser",
+                            provider="provider-not-for-the-browser")
     body = client.get(f"/api/projects/{project['id']}").text
     assert "internal_path" not in body
     assert "clip_key" not in body
+    assert "clip_hash" not in body
+    assert "clip_provider" not in body
+    assert "hash-not-for-the-browser" not in body
+    assert "provider-not-for-the-browser" not in body
 
 
 def test_cancel_a_queued_job():

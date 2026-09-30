@@ -201,8 +201,10 @@ def _serialize(conn, project: dict) -> dict:
     for scene in scenes:
         asset = by_id.get(scene.get("asset_id"))
         scene["asset_url"] = asset["url"] if asset else None
-        # Internal only: the browser never needs a storage key.
+        # Internal only: the browser never needs the clip cache.
         scene.pop("clip_key", None)
+        scene.pop("clip_hash", None)
+        scene.pop("clip_provider", None)
 
     out["scenes"] = scenes
     out["assets"] = assets
