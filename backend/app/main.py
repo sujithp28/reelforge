@@ -458,6 +458,12 @@ async def upload_asset(
                 stale = repo.clear_all_clips(conn, project_id)
         repo.invalidate_render(conn, project_id)
         payload = _serialize(conn, _require_project(conn, project_id))
+        if kind == "image":
+            attached = sum(1 for scene in payload["scenes"] if scene.get("asset_id") == asset_id)
+            log.info(
+                "image upload project=%s asset=%s key=%s target=%s attached_scenes=%d",
+                project_id, asset_id, key, scene_id or "bare-scenes", attached,
+            )
     for key in stale:
         storage.storage.delete_prefix(key)
     return payload

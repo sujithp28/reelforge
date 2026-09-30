@@ -25,12 +25,15 @@ gap itself, rather than relaxing the contract.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 from . import config
 from .ffmpeg import FPS, RenderError, build_card_clip_cmd, build_still_clip_cmd, run
+
+log = logging.getLogger("reelforge.mock")
 
 
 @dataclass(frozen=True)
@@ -73,12 +76,15 @@ class MockGenerator:
         return True
 
     def generate(self, spec: SceneSpec, out: Path) -> None:
-        if spec.image_path and Path(spec.image_path).exists():
+        image = spec.image_path
+        if image and Path(image).exists():
+            log.info("scene %s ffmpeg still %s", spec.scene_id, image)
             cmd = build_still_clip_cmd(
-                image=str(spec.image_path), out=str(out), seconds=spec.seconds,
+                image=str(image), out=str(out), seconds=spec.seconds,
                 width=spec.width, height=spec.height, caption=spec.caption,
             )
         else:
+            log.info("scene %s ffmpeg card image=%s", spec.scene_id, image or "none")
             cmd = build_card_clip_cmd(
                 out=str(out), seconds=spec.seconds, width=spec.width,
                 height=spec.height, caption=spec.caption or spec.title,

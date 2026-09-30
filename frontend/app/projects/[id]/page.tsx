@@ -86,6 +86,22 @@ export default function ProjectPage() {
       <div className="mx-auto max-w-6xl">
         <Link href="/dashboard" className="mb-8 inline-flex items-center gap-2 text-sm text-zinc-400 hover:text-white"><ArrowLeft size={16}/> Dashboard</Link>
 
+        {!project.scenes.some(scene => scene.asset_url) && (
+          <label className="relative mb-6 flex cursor-pointer items-center justify-center gap-2 rounded-2xl border border-dashed border-amber-700/80 bg-amber-950/30 p-4 text-sm text-amber-100">
+            <ImagePlus size={16}/> Add a photo for every scene. Without one, the reel is title cards.
+            <input
+              type="file"
+              accept="image/jpeg,image/png,image/webp,image/bmp"
+              className="absolute inset-0 cursor-pointer opacity-0"
+              onChange={e => {
+                const f = e.target.files?.[0];
+                if (f) void act("photo", () => api.upload(project.id, f));
+                e.target.value = "";
+              }}
+            />
+          </label>
+        )}
+
         <header className="mb-8 flex flex-wrap items-end justify-between gap-4">
           <div>
             <p className="text-sm text-violet-400">Storyboard</p>
@@ -344,7 +360,8 @@ function SceneCard({
         <input
           type="file"
           accept="image/jpeg,image/png,image/webp,image/bmp"
-          className="sr-only"
+          aria-label="Replace this scene's still"
+          className="absolute inset-0 cursor-pointer opacity-0"
           onChange={e => {
             const f = e.target.files?.[0];
             if (f) onUpload(f);

@@ -156,6 +156,12 @@ def _execute(job_id: str, project_id: str) -> None:
             scene_id: storage.storage.localize(key) if key else None
             for scene_id, key in image_keys.items()
         }
+        for scene_id, path in images.items():
+            log.info(
+                "job %s scene %s reference=%s file=%s",
+                job_id, scene_id, image_keys.get(scene_id) or "none",
+                path if path else "none",
+            )
         audio = render.AudioSettings(
             music_path=storage.storage.localize(music["storage_key"]) if music else None,
             volume=float(project.get("music_volume", 0.8) or 0.8),

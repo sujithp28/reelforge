@@ -274,6 +274,85 @@ def _hex_rgb(value: str) -> tuple[int, int, int]:
     return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
 
 
+def test_browser_create_upload_render_puts_the_image_in_the_mp4():
+    """Same requests the create page sends: JSON project, then multipart upload.
+
+    The photo is not a scene field on create. It is a second request with no
+    scene id, which must attach to every bare scene. The finished MP4 has to
+    show that image in every scene. A title card anywhere is a failure.
+    """
+    if not ffmpeg.ffmpeg_available():
+        print("  (skipped browser image flow: ffmpeg not on PATH)")
+        return
+
+    from fastapi.testclient import TestClient
+
+    from app import jobs
+    from app.main import app
+
+    root = _IMAGE_REEL_ROOT
+    client = TestClient(app)
+    created = client.post("/api/projects", json={
+        "idea": "a modern luxury living room",
+        "category": "Cinematic",
+        "input_type": "Idea",
+        "duration": 6,
+        "aspect_ratio": "9:16",
+    })
+    assert created.status_code == 201, created.text
+    project = created.json()
+    assert all(s["asset_url"] is None for s in project["scenes"])
+
+    still = root / "living-room.jpg"
+    ffmpeg.run([
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-f", "lavfi", "-i", "color=c=0xE23B2F:s=1280x720",
+        "-frames:v", "1", str(still),
+    ])
+    uploaded = client.post(
+        f"/api/projects/{project['id']}/uploads",
+        files={"file": ("living-room.jpg", still.read_bytes(), "image/jpeg")},
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    body = uploaded.json()
+    assert body["assets"] and body["assets"][0]["kind"] == "image"
+    assert all(s["asset_url"] for s in body["scenes"]), body["scenes"]
+    scenes = body["scenes"]
+    assert sum(s["duration"] for s in scenes) == 6
+
+    started = client.post(f"/api/projects/{project['id']}/render", json={})
+    assert started.status_code == 202, started.text
+    jobs._execute(started.json()["job_id"], project["id"])
+
+    done = client.get(f"/api/projects/{project['id']}").json()
+    assert done["status"] == "ready", done.get("error")
+    video = root / done["video_url"].split("/media/", 1)[1]
+    duration = ffmpeg.probe_duration(str(video))
+    assert duration is not None and abs(duration - 6) < 0.05, duration
+    info = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height,r_frame_rate",
+         "-of", "csv=p=0", str(video)],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert info == "1080,1920,30/1", info
+
+    print(
+        f"  browser-flow mp4 {video.name} {video.stat().st_size} bytes"
+        f" {duration:.3f}s {info}"
+    )
+    cursor = 0.4
+    for scene in scenes:
+        pixel = _rgb(video, cursor, "120:120:80:80")
+        print(f"  frame {cursor:.1f}s {scene['title']} rgb={tuple(round(c) for c in pixel)}")
+        assert pixel[0] > 140 and pixel[0] > pixel[2] + 40, (scene["title"], pixel)
+        for color in ffmpeg.CARD_COLORS:
+            card = _hex_rgb(color)
+            distance = sum(abs(pixel[i] - card[i]) for i in range(3))
+            assert distance > 80, (scene["title"], pixel, color)
+        cursor += scene["duration"]
+
+
 def test_uploaded_image_is_in_the_reel_and_cards_remain_without_one():
     """Upload path: one scene with a still, one without, exact duration.
 

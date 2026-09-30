@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useMemo, useState } from "react";
+import { Suspense, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { ArrowLeft, ArrowRight, ImagePlus, Loader2, Sparkles, Upload, X } from "lucide-react";
@@ -26,6 +26,9 @@ function CreateForm() {
   const [duration, setDuration] = useState(30);
   const [quality, setQuality] = useState<Quality>("standard");
   const [file, setFile] = useState<File | null>(null);
+  // The storyboard request is JSON and cannot carry the photo. generate()
+  // reads this ref so a selection cannot be dropped by a stale render.
+  const fileRef = useRef<File | null>(null);
   const [step, setStep] = useState(1);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -34,6 +37,11 @@ function CreateForm() {
   const [createdId, setCreatedId] = useState<string | null>(null);
 
   const ready = useMemo(() => idea.trim().length > 0, [idea]);
+
+  function chooseFile(next: File | null) {
+    fileRef.current = next;
+    setFile(next);
+  }
 
   async function generate() {
     setBusy(true);
@@ -55,8 +63,9 @@ function CreateForm() {
       // Uploads need a project to attach to, so the staged file goes up second.
       // A failure here used to be discarded, and every scene then rendered as
       // a title card with no sign the photo never landed.
-      if (file) {
-        await api.upload(projectId, file);
+      const chosen = fileRef.current;
+      if (chosen) {
+        await api.upload(projectId, chosen);
       }
       router.push(`/projects/${projectId}`);
     } catch (e) {
@@ -73,6 +82,11 @@ function CreateForm() {
           <div className="mb-8">
             <p className="text-sm text-violet-400">Step 2 of 2</p>
             <h1 className="mt-2 text-3xl font-semibold">Your reel settings</h1>
+            {file ? (
+              <p className="mt-3 text-sm text-zinc-300">Reference photo: {file.name}. It will be used for every scene.</p>
+            ) : (
+              <p className="mt-3 text-sm text-amber-200/90">No reference photo is selected, so the reel will be title cards. Go back to add one.</p>
+            )}
           </div>
           <div className="grid gap-6 md:grid-cols-2">
             <section className="rounded-2xl border border-zinc-800 bg-zinc-900 p-6">
@@ -161,20 +175,23 @@ function CreateForm() {
               </div>
 
               {!file && (
-                <label className="mt-4 flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border border-dashed border-zinc-700 p-7 text-sm text-zinc-400 hover:bg-zinc-950">
+                <label className="relative mt-4 flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border border-dashed border-zinc-700 p-7 text-sm text-zinc-400 hover:bg-zinc-950">
                   <Upload size={18}/> Upload reference <ImagePlus size={18}/>
                   <input
                     type="file"
                     accept="image/jpeg,image/png,image/webp,image/bmp"
-                    className="hidden"
-                    onChange={e => setFile(e.target.files?.[0] ?? null)}
+                    className="absolute inset-0 cursor-pointer opacity-0"
+                    onChange={e => {
+                      const next = e.target.files?.[0] ?? null;
+                      if (next) chooseFile(next);
+                    }}
                   />
                 </label>
               )}
               {file && (
                 <div className="mt-4 flex items-center justify-between rounded-xl border border-zinc-800 bg-zinc-950 p-4 text-sm">
                   <span className="truncate text-zinc-300">{file.name}</span>
-                  <button onClick={() => setFile(null)} aria-label="Remove reference" className="ml-3 shrink-0 text-zinc-500 hover:text-white"><X size={16}/></button>
+                  <button onClick={() => chooseFile(null)} aria-label="Remove reference" className="ml-3 shrink-0 text-zinc-500 hover:text-white"><X size={16}/></button>
                 </div>
               )}
             </div>
