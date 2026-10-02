@@ -3,9 +3,10 @@
 Free GPU generation for the ReelForge beta, using open-source models on a
 Kaggle T4 session. Two workers exist:
 
-- `wan_worker.py` — Wan 2.1 1.3B, the intended beta provider (`wan`).
-  Documented in [Setup: Wan 2.1](#setup-wan-21-the-intended-beta-provider)
-  below.
+- `wan2gp_poll.ipynb` — proven Wan2GP text-to-video worker (`wan`).
+  Documented in [Proven Wan2GP polling notebook](#proven-wan2gp-polling-notebook).
+- `wan_worker.py` — older Diffusers Wan 2.1 worker, kept and still tested.
+  It is not the proven generator.
 - `reelforge_worker.py` — LTX-Video (`kaggle` provider), kept for now; see
   [Setup: LTX-Video](#setup-ltx-video) further down.
 
@@ -102,7 +103,23 @@ landscape frame. Frame counts are snapped up to LTX's 8k+1 requirement and
 the backend trims to the exact customer duration. There is **no 6-second
 floor** here: unlike the hosted API, a 2-second scene generates ~2 seconds.
 
-## Setup: Wan 2.1 (the intended beta provider)
+## Proven Wan2GP polling notebook
+
+`wan2gp_poll.ipynb` is the generator that has already produced a verified
+81-frame MP4. It checks out Wan2GP commit `b8b18f8`, claims one `provider=wan`
+job, and runs `wgp.py` at 416×240, 81 frames, 20 steps, FP16, SDPA, profile 5,
+seed 1, on `cuda:0`. The scene must be 5 seconds. The notebook does not change
+those settings after a failure.
+
+`wan_worker.py` below is the older Diffusers worker. It is still in the repo
+and still covered by tests. It is not the proven generator and it is not what
+the first integration run should execute.
+
+Do not push either notebook until a run has been explicitly approved. The
+one-shot notebook that produced the local MP4s lives in a separate project;
+do not overwrite that Kaggle kernel with this polling notebook.
+
+## Setup: Wan 2.1 Diffusers worker (older path)
 
 Create a notebook, set the accelerator to **GPU T4 x2**, enable internet, and
 add your worker token as a Kaggle Secret rather than typing it in a cell.

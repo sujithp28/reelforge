@@ -32,7 +32,7 @@ S3_PUBLIC_BASE = os.environ.get("REELFORGE_S3_PUBLIC_BASE", "")
 MEDIA_URL_PREFIX = "/media"
 
 # --- video generation -------------------------------------------------------
-# "mock" (default: ffmpeg stills and type cards, no GPU) or "ltx".
+# "mock" (default: ffmpeg stills and type cards, no GPU), "ltx", "kaggle", or "wan".
 VIDEO_PROVIDER = os.environ.get("REELFORGE_VIDEO_PROVIDER", "mock").lower()
 
 # Base URL of the LTX API. Points at the official hosted service by default;
@@ -93,13 +93,34 @@ KAGGLE_MAX_CLIP_BYTES = int(
 # argument, so a Tesla T4 (Turing, no bf16 support) can run this in fp16
 # without patching vendored inference code.
 WAN_MODEL_ID = os.environ.get("REELFORGE_WAN_MODEL_ID", "Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
-# Generation geometry and step count. Wan2.1 1.3B has no step-distilled
-# checkpoint, so this is meaningfully slower per clip than the LTX path.
-WAN_GEN_WIDTH = int(os.environ.get("REELFORGE_WAN_GEN_WIDTH", "832"))
-WAN_GEN_HEIGHT = int(os.environ.get("REELFORGE_WAN_GEN_HEIGHT", "480"))
+# Proven Wan2GP text-to-video settings (commit b8b18f8, model t2v_1.3B).
+# kaggle/wan2gp_job.py is what the polling notebook actually runs. These
+# constants are not environment-driven, so a local .env cannot change a
+# verified run. Precision is FP16, attention is SDPA, profile is 5, and the
+# process is pinned to cuda:0.
+WAN2GP_COMMIT = "b8b18f8114e432eea8f3d7e853a51dd91fa99571"
+WAN2GP_MODEL_TYPE = "t2v_1.3B"
+WAN2GP_WIDTH = 416
+WAN2GP_HEIGHT = 240
+WAN2GP_FRAMES = 81
+WAN2GP_FPS = 16
+WAN2GP_STEPS = 20
+WAN2GP_SEED = 1
+WAN2GP_ATTENTION = "sdpa"
+WAN2GP_PROFILE = "5"
+WAN2GP_GPU = "cuda:0"
+# 81 frames at 16 fps is 5.0625s. The upload check accepts that for a scene
+# of 5 seconds (tolerance 0.25s) and rejects it for 6. The notebook generates
+# only for a 5-second scene.
+WAN2GP_SCENE_SECONDS = 5
+# Geometry recorded for operators. The diffusers worker in kaggle/wan_worker.py
+# still has its own fallbacks and is not the proven generator.
+WAN_GEN_WIDTH = int(os.environ.get("REELFORGE_WAN_GEN_WIDTH", "416"))
+WAN_GEN_HEIGHT = int(os.environ.get("REELFORGE_WAN_GEN_HEIGHT", "240"))
 WAN_GEN_FPS = int(os.environ.get("REELFORGE_WAN_GEN_FPS", "16"))
-WAN_STEPS_STANDARD = int(os.environ.get("REELFORGE_WAN_STEPS_STANDARD", "30"))
-WAN_STEPS_HIGH = int(os.environ.get("REELFORGE_WAN_STEPS_HIGH", "40"))
+WAN_GEN_FRAMES = int(os.environ.get("REELFORGE_WAN_GEN_FRAMES", "81"))
+WAN_STEPS_STANDARD = int(os.environ.get("REELFORGE_WAN_STEPS_STANDARD", "20"))
+WAN_STEPS_HIGH = int(os.environ.get("REELFORGE_WAN_STEPS_HIGH", "20"))
 WAN_GUIDANCE_SCALE = float(os.environ.get("REELFORGE_WAN_GUIDANCE_SCALE", "5.0"))
 # A scene may wait longer than an LTX job before it fails cleanly: Wan's
 # undistilled step count makes even a short clip take minutes, not seconds.
