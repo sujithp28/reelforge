@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,6 +31,7 @@ CUSTOMER_RENDER_ERROR = (
 from . import ffmpeg
 from .ffmpeg import RenderError
 from .providers import SceneSpec, VideoGenerator
+from .export_presets import ExportPreset
 from .storyboard import resolution_for
 
 
@@ -57,8 +59,10 @@ class SceneGenerationError(RenderError):
         self.total = total
         if len(failures) == 1:
             only = failures[0]
+            # The scene number is for the customer. The encoder text stays on
+            # the failure record and in the log, not in this message.
             super().__init__(
-                f"Scene {only.index + 1} couldn’t be generated. {only.message}"
+                f"Scene {only.index + 1} couldn’t be generated. Please try again."
             )
         else:
             listed = ", ".join(str(f.index + 1) for f in failures)
@@ -73,6 +77,7 @@ class AudioSettings:
     music_path: Path | None = None
     volume: float = 0.8
     fade_out: int = 2
+    fade_in: float = 1.0
 
 
 class RenderHooks(Protocol):
@@ -128,17 +133,72 @@ def scene_fingerprint(spec: SceneSpec, provider: str) -> str:
         f"{spec.width}x{spec.height}",
         str(spec.fps),
         spec.quality,
-        # Motion follows the scene index, so a moved scene cannot reuse a clip.
-        str(spec.index),
         # The asset id is part of an uploaded file's name, so a replaced
         # reference image produces a different name and a different clip.
         Path(spec.image_path).name if spec.image_path else "",
     ]
+    if provider == "mock":
+        # Still motion follows the scene index. A moved photo cannot reuse
+        # the clip from its old place. Other providers do not use that index.
+        parts.append(str(spec.index))
+        # The local still look is not part of the scene row. Without this, a
+        # re-render would keep the previous Ken Burns clip. The lines are the
+        # text actually drawn, so a disabled title cannot reuse an old clip.
+        parts.append(ffmpeg.STILL_LOOK_ID)
+        parts.append(spec.text_title or "")
+        parts.append(spec.text_subtitle or "")
     return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:32]
 
 
+_FORBIDDEN_OVERLAY = re.compile(
+    r"\bno (?:text|logo|watermark|caption)\b", re.IGNORECASE
+)
+
+
+def prompt_forbids_overlay(prompt: str | None) -> bool:
+    """True when the scene prompt says the picture must stay free of type."""
+    return _FORBIDDEN_OVERLAY.search(prompt or "") is not None
+
+
+def configured_end_card(scenes: list[dict]) -> tuple[str, str, int] | None:
+    """A brand card after the last scene, only when that scene asks for one."""
+    if not scenes:
+        return None
+    card = scenes[-1].get("end_card")
+    if not isinstance(card, dict):
+        return None
+    title = str(card.get("title") or "").strip()
+    subtitle = str(card.get("subtitle") or "").strip()
+    if not title and not subtitle:
+        return None
+    try:
+        seconds = int(card.get("seconds", 3))
+    except (TypeError, ValueError):
+        seconds = 3
+    return title, subtitle, max(1, min(seconds, 8))
+
+
+def visible_overlay(scene: dict) -> tuple[str | None, str | None]:
+    """Title and subtitle to burn, or nothing when the customer left them off.
+
+    The project idea is not a title. A scene with no design text stays a photograph.
+    A prompt that forbids text, a logo, a watermark, or a caption stays a photograph
+    even when titles are switched on. The brand card is a separate clip.
+    """
+    if prompt_forbids_overlay(scene.get("prompt")):
+        return (None, None)
+    title = (scene.get("text_title") or "").strip()
+    subtitle = (scene.get("text_subtitle") or "").strip()
+    if not scene.get("show_title"):
+        title = ""
+    if not scene.get("show_subtitle"):
+        subtitle = ""
+    return (title or None, subtitle or None)
+
+
 def build_scene_spec(scene: dict, index: int, width: int, height: int,
-                     image: Path | None, quality: str) -> SceneSpec:
+                     image: Path | None, quality: str, fps: int = ffmpeg.FPS) -> SceneSpec:
+    text_title, text_subtitle = visible_overlay(scene)
     return SceneSpec(
         scene_id=scene["id"],
         index=index,
@@ -148,9 +208,88 @@ def build_scene_spec(scene: dict, index: int, width: int, height: int,
         seconds=max(1, int(scene["duration"])),
         width=width,
         height=height,
+        fps=fps,
         image_path=image,
         quality=quality,
+        text_title=text_title,
+        text_subtitle=text_subtitle,
     )
+
+
+def assembly_joins(asset_ids: list[str | None]) -> list[str]:
+    """How each pair of neighboring scenes is joined.
+
+    The same asset is a hard cut. Different images, or scenes with no still,
+    use the same wipe.
+    """
+    joins: list[str] = []
+    for index in range(1, len(asset_ids)):
+        left = asset_ids[index - 1]
+        right = asset_ids[index]
+        joins.append("cut" if left and left == right else "fade")
+    return joins
+
+
+def group_bounds(asset_ids: list[str | None]) -> list[tuple[int, int]]:
+    """Half-open ranges of scenes that share one asset and must be cut together."""
+    if not asset_ids:
+        return []
+    groups: list[tuple[int, int]] = []
+    start = 0
+    for index in range(1, len(asset_ids)):
+        left = asset_ids[index - 1]
+        right = asset_ids[index]
+        if not (left and left == right):
+            groups.append((start, index))
+            start = index
+    groups.append((start, len(asset_ids)))
+    return groups
+
+
+def assembly_stages(asset_ids: list[str | None]) -> list[str]:
+    """FFmpeg stages for these assets: hard concat inside a group, fade between groups."""
+    groups = group_bounds(asset_ids)
+    if len(groups) <= 1:
+        return ["concat"]
+    stages: list[str] = []
+    if any(end - start > 1 for start, end in groups):
+        stages.append("concat")
+    stages.append("crossfade")
+    return stages
+
+
+def _write_concat(work_dir: Path, name: str, paths: list[Path], out: Path) -> None:
+    list_file = work_dir / f"{name}.txt"
+    list_file.write_text(
+        ffmpeg.build_concat_list([str(path) for path in paths]), encoding="utf-8"
+    )
+    ffmpeg.run(ffmpeg.build_concat_cmd(str(list_file), str(out)))
+
+
+def assemble_timeline(
+    clips: list[Path], scenes: list[dict], work_dir: Path, joined: Path,
+) -> None:
+    """Join scene clips. Identical neighboring assets are a cut; the rest wipe."""
+    asset_ids = [scene.get("asset_id") for scene in scenes]
+    groups = group_bounds(asset_ids)
+    if len(groups) <= 1:
+        _write_concat(work_dir, "concat", clips, joined)
+        return
+    group_paths: list[Path] = []
+    group_durations: list[int] = []
+    for index, (start, end) in enumerate(groups):
+        members = clips[start:end]
+        duration = sum(max(1, int(scenes[i]["duration"])) for i in range(start, end))
+        if len(members) == 1:
+            group_paths.append(members[0])
+        else:
+            merged = work_dir / f"cut_{index:02d}.mp4"
+            _write_concat(work_dir, f"cut_{index:02d}", members, merged)
+            group_paths.append(merged)
+        group_durations.append(duration)
+    ffmpeg.run(ffmpeg.build_crossfade_cmd(
+        [str(path) for path in group_paths], group_durations, str(joined),
+    ))
 
 
 def render_reel(
@@ -164,6 +303,7 @@ def render_reel(
     on_progress: Callable[[int], None] | None = None,
     hooks: RenderHooks | None = None,
     quality: str = "standard",
+    preset: ExportPreset | None = None,
 ) -> Path:
     """Render `scenes` into a single mp4 at `out_path`. Returns that path."""
     if not ffmpeg.ffmpeg_available():
@@ -175,7 +315,11 @@ def render_reel(
         raise RenderError(CUSTOMER_RENDER_ERROR)
 
     hooks = hooks or NoHooks()
-    width, height = resolution_for(aspect_ratio)
+    if preset is not None:
+        width, height, fps = preset.width, preset.height, preset.fps
+    else:
+        width, height = resolution_for(aspect_ratio)
+        fps = ffmpeg.FPS
     work_dir.mkdir(parents=True, exist_ok=True)
     audio = audio or AudioSettings()
 
@@ -188,7 +332,7 @@ def render_reel(
                 raise RenderCancelled("cancelled before scene %d" % (i + 1))
 
             spec = build_scene_spec(
-                scene, i, width, height, images.get(scene["id"]), quality
+                scene, i, width, height, images.get(scene["id"]), quality, fps
             )
             fingerprint = scene_fingerprint(spec, generator.name)
 
@@ -239,27 +383,41 @@ def render_reel(
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
         joined = work_dir / "joined.mp4"
-        if len(clips) == 1:
-            list_file = work_dir / "concat.txt"
-            list_file.write_text(
-                ffmpeg.build_concat_list([str(clips[0])]), encoding="utf-8"
-            )
-            ffmpeg.run(ffmpeg.build_concat_cmd(str(list_file), str(joined)))
-        else:
-            ffmpeg.run(ffmpeg.build_crossfade_cmd(
-                [str(c) for c in clips],
-                [max(1, int(s["duration"])) for s in scenes],
-                str(joined),
+        timeline_scenes = list(scenes)
+        card = configured_end_card(scenes)
+        if card is not None:
+            title, subtitle, card_seconds = card
+            caption = title if not subtitle else f"{title}  {subtitle}"
+            card_path = work_dir / "end_card.mp4"
+            ffmpeg.run(ffmpeg.build_card_clip_cmd(
+                out=str(card_path), seconds=card_seconds,
+                width=width, height=height, caption=caption, index=len(scenes),
+                fps=fps,
             ))
+            clips.append(card_path)
+            timeline_scenes.append({
+                "asset_id": "end-card",
+                "duration": card_seconds,
+            })
+        assemble_timeline(clips, timeline_scenes, work_dir, joined)
         if on_progress:
             on_progress(90)
 
-        total = sum(int(s["duration"]) for s in scenes)
-        if audio.music_path and Path(audio.music_path).exists():
+        total = sum(int(s["duration"]) for s in timeline_scenes)
+        music = audio.music_path
+        usable = (
+            music is not None
+            and Path(music).is_file()
+            and ffmpeg.has_audio_stream(str(music))
+        )
+        if music is not None and not usable:
+            log.info("music left off the reel; the picture is unchanged")
+        if usable:
             ffmpeg.run(ffmpeg.build_music_mux_cmd(
-                video=str(joined), music=str(audio.music_path),
+                video=str(joined), music=str(music),
                 out=str(out_path), total_seconds=total,
                 volume=audio.volume, fade_out=audio.fade_out,
+                fade_in=audio.fade_in,
             ))
         else:
             ffmpeg.run(ffmpeg.build_finalize_cmd(str(joined), str(out_path)))

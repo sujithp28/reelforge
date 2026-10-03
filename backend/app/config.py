@@ -135,6 +135,14 @@ WAN_CLAIM_TIMEOUT_SECONDS = int(os.environ.get("REELFORGE_WAN_CLAIM_TIMEOUT", "3
 QUALITIES = ("standard", "high")
 DEFAULT_QUALITY = os.environ.get("REELFORGE_DEFAULT_QUALITY", "standard").lower()
 
+# --- storyboard -------------------------------------------------------------
+# "template" (default) is the beat-sheet planner. "model" is reserved for a
+# future vision-capable planner. That planner is not connected; any failure
+# falls back to the template, and this setting never reaches the customer.
+STORYBOARD_PROVIDER = os.environ.get(
+    "REELFORGE_STORYBOARD_PROVIDER", "template"
+).strip().lower()
+
 # --- jobs -------------------------------------------------------------------
 # "thread" (default: in-process worker) or "external" (a separate worker
 # process drains the queue; the API only enqueues).

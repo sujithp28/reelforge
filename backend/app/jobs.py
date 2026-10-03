@@ -22,7 +22,7 @@ import logging
 import threading
 from pathlib import Path
 
-from . import config, db, providers, render, repo, storage
+from . import config, db, export_presets, providers, render, repo, storage
 from .ffmpeg import RenderError
 
 log = logging.getLogger("reelforge.jobs")
@@ -138,6 +138,13 @@ def _progress(job_id: str, project_id: str):
     return report
 
 
+def _music_volume(project: dict) -> float:
+    """Playback level for the mix. Zero is silence, not a missing setting."""
+    if "music_volume" not in project or project["music_volume"] is None:
+        return 0.8
+    return float(project["music_volume"])
+
+
 def _execute(job_id: str, project_id: str) -> None:
     try:
         with db.connect() as conn:
@@ -162,10 +169,12 @@ def _execute(job_id: str, project_id: str) -> None:
                 job_id, scene_id, image_keys.get(scene_id) or "none",
                 path if path else "none",
             )
+        use_music = bool(project.get("music_enabled")) and music is not None
         audio = render.AudioSettings(
-            music_path=storage.storage.localize(music["storage_key"]) if music else None,
-            volume=float(project.get("music_volume", 0.8) or 0.8),
+            music_path=storage.storage.localize(music["storage_key"]) if use_music else None,
+            volume=_music_volume(project),
             fade_out=int(project.get("music_fade_out", 2) or 0),
+            fade_in=float(project.get("music_fade_in", 1) or 0),
         )
 
         generator = providers.build_generator(provider_name)
@@ -174,10 +183,13 @@ def _execute(job_id: str, project_id: str) -> None:
         # never touch the finished reel.
         staged = config.DATA_DIR / "work" / f"{project_id}-reel.mp4"
 
+        preset = export_presets.resolve(
+            project.get("export_preset"), project["aspect_ratio"],
+        )
         render.render_reel(
             scenes=scenes,
             images=images,
-            aspect_ratio=project["aspect_ratio"],
+            aspect_ratio=preset.aspect_ratio,
             work_dir=work_dir,
             out_path=staged,
             generator=generator,
@@ -185,6 +197,7 @@ def _execute(job_id: str, project_id: str) -> None:
             on_progress=_progress(job_id, project_id),
             hooks=DbHooks(job_id, project_id, generator.name),
             quality=project.get("quality") or config.DEFAULT_QUALITY,
+            preset=preset,
         )
 
         # The finished file only enters storage once, under a stable key.

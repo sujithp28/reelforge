@@ -11,6 +11,7 @@ backend downloads it to a temporary file first. That is the whole contract.
 """
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 from typing import Protocol
@@ -77,11 +78,16 @@ class LocalStorage:
         """
         path = self._path(key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        if Path(source).resolve() != path:
-            if move:
-                shutil.move(str(source), path)
-            else:
-                shutil.copy2(str(source), path)
+        if Path(source).resolve() == path:
+            return key
+        # Write beside the destination, then replace it. A failed render never
+        # reaches this, and a failed replace leaves the previous file in place.
+        partial = path.with_name(path.name + ".partial")
+        if move:
+            shutil.move(str(source), partial)
+        else:
+            shutil.copy2(str(source), partial)
+        os.replace(partial, path)
         return key
 
     def localize(self, key: str) -> Path | None:

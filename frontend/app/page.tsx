@@ -5,6 +5,7 @@ const types = [
   ["🎬", "Cinematic"], ["🛍️", "Product"], ["🏢", "Business"],
   ["🏠", "Real Estate"], ["👤", "Personal"], ["📱", "Social Media"],
   ["🎉", "Event"], ["✨", "Creative"], ["＋", "Other"],
+  ["🏛️", "Luxury Interiors"],
 ];
 
 export default function Home() {
@@ -48,6 +49,11 @@ export default function Home() {
               <p className="text-sm text-zinc-500">Choose what best describes your reel. ReelForge handles the workflow.</p>
             </div>
           </div>
+          <Link href="/create?type=Luxury%20Interiors" className="mb-4 block rounded-2xl border p-5" style={{ borderColor: "#C6A15B", background: "#1B2838", color: "#F7F4EF" }}>
+            <div className="text-xs" style={{ color: "#C6A15B" }}>Template</div>
+            <div className="mt-2 text-lg font-semibold">Luxury Interiors</div>
+            <p className="mt-1 text-sm" style={{ color: "#E7DCC8" }}>A five-scene vertical reel. English or Telugu. Use your own photos.</p>
+          </Link>
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
             {types.map(([emoji, name]) => (
               <Link key={name} href={`/create?type=${encodeURIComponent(name)}`} className="rounded-2xl border border-zinc-800 bg-zinc-900/50 p-5 transition hover:-translate-y-0.5 hover:border-zinc-700 hover:bg-zinc-900">

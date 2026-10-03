@@ -57,7 +57,12 @@ def list_projects(conn: Any, limit: int = 100, offset: int = 0) -> list[dict]:
     return rows_to_dicts(conn.execute(
         db.sql(
             "SELECT p.*, (SELECT COUNT(*) FROM scenes s WHERE s.project_id = p.id)"
-            " AS scene_count FROM projects p"
+            " AS scene_count,"
+            " (SELECT a.storage_key FROM scenes s"
+            " JOIN assets a ON a.id = s.asset_id"
+            " WHERE s.project_id = p.id AND a.kind = 'image'"
+            " ORDER BY s.position LIMIT 1) AS cover_key"
+            " FROM projects p"
             " ORDER BY p.created_at DESC, p.id DESC LIMIT ? OFFSET ?"
         ),
         (limit, offset),
@@ -73,7 +78,9 @@ def delete_project(conn: Any, project_id: str) -> None:
 
 
 def update_audio_settings(
-    conn: Any, project_id: str, *, volume: float | None, fade_out: int | None
+    conn: Any, project_id: str, *,
+    volume: float | None = None, fade_out: int | None = None,
+    fade_in: int | None = None, enabled: bool | None = None,
 ) -> None:
     sets, params = [], []
     if volume is not None:
@@ -82,6 +89,12 @@ def update_audio_settings(
     if fade_out is not None:
         sets.append("music_fade_out = ?")
         params.append(fade_out)
+    if fade_in is not None:
+        sets.append("music_fade_in = ?")
+        params.append(fade_in)
+    if enabled is not None:
+        sets.append("music_enabled = ?")
+        params.append(1 if enabled else 0)
     if not sets:
         return
     params.append(project_id)
@@ -89,6 +102,39 @@ def update_audio_settings(
         db.sql(f"UPDATE projects SET {', '.join(sets)}, updated_at = {{now}}"
                " WHERE id = ?"),
         tuple(params),
+    )
+
+
+def set_luxury_copy(
+    conn: Any, project_id: str, brand_name: str, content_script: str,
+) -> None:
+    """Store the editable luxury script. Does not touch the rendered file."""
+    conn.execute(
+        db.sql(
+            "UPDATE projects SET brand_name = ?, content_script = ?,"
+            " updated_at = {now} WHERE id = ?"
+        ),
+        (brand_name, content_script, project_id),
+    )
+
+
+def set_logo_asset(conn: Any, project_id: str, asset_id: str | None) -> None:
+    """Point the project at a logo asset. The logo is not burned into the reel."""
+    conn.execute(
+        db.sql(
+            "UPDATE projects SET logo_asset_id = ?, updated_at = {now} WHERE id = ?"
+        ),
+        (asset_id, project_id),
+    )
+
+
+def set_export_preset(conn: Any, project_id: str, preset_id: str, aspect_ratio: str) -> None:
+    conn.execute(
+        db.sql(
+            "UPDATE projects SET export_preset = ?, aspect_ratio = ?,"
+            " updated_at = {now} WHERE id = ?"
+        ),
+        (preset_id, aspect_ratio, project_id),
     )
 
 
@@ -100,17 +146,24 @@ def set_quality(conn: Any, project_id: str, quality: str) -> None:
 
 
 def invalidate_render(conn: Any, project_id: str) -> None:
-    """Drop a rendered video that no longer matches the storyboard.
+    """Mark the finished reel out of date without deleting it.
 
-    Called after any storyboard or asset change so the preview can never show
-    a reel that does not match what is on screen.
+    The previous MP4 stays available until a later render replaces it. A failed
+    attempt must not be the thing that removes the last good file.
     """
     conn.execute(
         db.sql(
             "UPDATE projects SET status = ?, progress = 0, error = NULL,"
-            " video_key = NULL, updated_at = {now} WHERE id = ?"
+            " output_stale = 1, updated_at = {now} WHERE id = ?"
         ),
         (DRAFT, project_id),
+    )
+
+
+def rename_project(conn: Any, project_id: str, title: str) -> None:
+    conn.execute(
+        db.sql("UPDATE projects SET title = ?, updated_at = {now} WHERE id = ?"),
+        (title, project_id),
     )
 
 
@@ -137,7 +190,7 @@ def mark_ready(conn: Any, project_id: str, video_key: str) -> None:
     conn.execute(
         db.sql(
             "UPDATE projects SET status = ?, progress = 100, error = NULL,"
-            " video_key = ?, updated_at = {now} WHERE id = ?"
+            " video_key = ?, output_stale = 0, updated_at = {now} WHERE id = ?"
         ),
         (READY, video_key, project_id),
     )
@@ -215,6 +268,36 @@ def insert_scenes(conn: Any, project_id: str, scenes: list[dict]) -> None:
     )
 
 
+def replace_scenes(conn: Any, project_id: str, scenes: list[dict]) -> list[str]:
+    """Delete this project's scenes and insert `scenes` in their place.
+
+    Child generation rows follow the scene delete. Returns clip storage keys
+    that nothing references anymore. Each scene may include `asset_id`.
+    """
+    rows = conn.execute(
+        db.sql("SELECT clip_key FROM scenes WHERE project_id = ?"
+               " AND clip_key IS NOT NULL"),
+        (project_id,),
+    ).fetchall()
+    stale = [row["clip_key"] for row in rows]
+    conn.execute(
+        db.sql("DELETE FROM scenes WHERE project_id = ?"),
+        (project_id,),
+    )
+    conn.executemany(
+        db.sql(
+            "INSERT INTO scenes (id, project_id, position, title, prompt, duration,"
+            " caption, asset_id) VALUES (?,?,?,?,?,?,?,?)"
+        ),
+        [
+            (new_id("scene"), project_id, s["position"], s["title"], s["prompt"],
+             s["duration"], s.get("caption"), s.get("asset_id"))
+            for s in scenes
+        ],
+    )
+    return stale
+
+
 def list_scenes(conn: Any, project_id: str) -> list[dict]:
     return rows_to_dicts(conn.execute(
         db.sql("SELECT * FROM scenes WHERE project_id = ? ORDER BY position"),
@@ -233,7 +316,10 @@ def get_scene(conn: Any, project_id: str, scene_id: str) -> dict | None:
 def update_scene(conn: Any, project_id: str, scene_id: str, fields: dict) -> bool:
     if not fields:
         return False
-    allowed = {"title", "prompt", "caption", "duration"}
+    allowed = {
+        "title", "prompt", "caption", "duration",
+        "text_title", "text_subtitle", "show_title", "show_subtitle",
+    }
     unknown = set(fields) - allowed
     if unknown:
         raise ValueError(f"cannot update scene columns: {sorted(unknown)}")
@@ -243,6 +329,89 @@ def update_scene(conn: Any, project_id: str, scene_id: str, fields: dict) -> boo
         (*fields.values(), scene_id, project_id),
     ).rowcount
     return bool(changed)
+
+
+def reorder_scenes(conn: Any, project_id: str, scene_ids: list[str]) -> list[str]:
+    """Move whole scenes. Titles, subtitles, and photos stay on their scene.
+
+    Only a scene whose place in the reel changed loses its cached clip. Motion
+    depends on that place, so a scene that did not move keeps its clip.
+    """
+    current = list_scenes(conn, project_id)
+    current_ids = [scene["id"] for scene in current]
+    if list(scene_ids) == current_ids:
+        return []
+    if len(scene_ids) != len(set(scene_ids)) or sorted(scene_ids) != sorted(current_ids):
+        raise ValueError("That scene list does not match this project.")
+    previous = {scene["id"]: scene["position"] for scene in current}
+    stale: list[str] = []
+    for position, scene_id in enumerate(scene_ids):
+        conn.execute(
+            db.sql("UPDATE scenes SET position = ? WHERE id = ? AND project_id = ?"),
+            (position, scene_id, project_id),
+        )
+        if previous[scene_id] != position:
+            key = clear_clip(conn, project_id, scene_id)
+            if key:
+                stale.append(key)
+    invalidate_render(conn, project_id)
+    return stale
+
+
+def append_scene(
+    conn: Any,
+    project_id: str,
+    *,
+    title: str,
+    prompt: str,
+    duration: int,
+    asset_id: str | None = None,
+) -> str:
+    position = conn.execute(
+        db.sql("SELECT COUNT(*) AS n FROM scenes WHERE project_id = ?"),
+        (project_id,),
+    ).fetchone()["n"]
+    scene_id = new_id("scene")
+    conn.execute(
+        db.sql(
+            "INSERT INTO scenes (id, project_id, position, title, prompt, duration,"
+            " caption, asset_id) VALUES (?,?,?,?,?,?,?,?)"
+        ),
+        (scene_id, project_id, int(position), title, prompt, duration, None, asset_id),
+    )
+    sync_project_duration(conn, project_id)
+    invalidate_render(conn, project_id)
+    return scene_id
+
+
+def remove_scene(conn: Any, project_id: str, scene_id: str) -> str | None:
+    """Delete one scene and close the gap in the order. The photo file stays."""
+    from . import config
+
+    scene = get_scene(conn, project_id, scene_id)
+    if scene is None:
+        raise LookupError("scene not found")
+    if len(list_scenes(conn, project_id)) <= 1:
+        raise ValueError("A reel needs at least one scene.")
+    remaining = total_scene_seconds(conn, project_id) - int(scene["duration"])
+    if remaining < config.MIN_REEL_SECONDS:
+        raise ValueError(
+            f"that would make the reel {remaining}s;"
+            f" the minimum is {config.MIN_REEL_SECONDS}s"
+        )
+    stale = clear_clip(conn, project_id, scene_id)
+    conn.execute(
+        db.sql("DELETE FROM scenes WHERE id = ? AND project_id = ?"),
+        (scene_id, project_id),
+    )
+    for position, row in enumerate(list_scenes(conn, project_id)):
+        conn.execute(
+            db.sql("UPDATE scenes SET position = ? WHERE id = ?"),
+            (position, row["id"]),
+        )
+    sync_project_duration(conn, project_id)
+    invalidate_render(conn, project_id)
+    return stale
 
 
 def bump_regeneration(conn: Any, scene_id: str, prompt: str) -> int:
@@ -374,16 +543,82 @@ def total_scene_seconds(conn: Any, project_id: str, exclude: str | None = None) 
 
 # --- assets -----------------------------------------------------------------
 
+_last_asset_stamp = ""
+_asset_tie = 0
+
+
+def _asset_created_at() -> str:
+    """Upload-order timestamp.
+
+    `datetime('now')` is whole seconds, so a batch uploaded together would
+    then sort by random id. Microseconds, plus a tie counter, keep insertion
+    order without a schema change.
+    """
+    global _last_asset_stamp, _asset_tie
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+    if stamp == _last_asset_stamp:
+        _asset_tie += 1
+    else:
+        _last_asset_stamp = stamp
+        _asset_tie = 0
+    return f"{stamp}{_asset_tie:02d}"
+
+
 def insert_asset(
     conn: Any, project_id: str, asset_id: str, kind: str, filename: str, key: str
 ) -> None:
     conn.execute(
         db.sql(
             "INSERT INTO assets (id, project_id, kind, filename, storage_key,"
-            " created_at) VALUES (?,?,?,?,?,{now})"
+            " created_at) VALUES (?,?,?,?,?,?)"
         ),
-        (asset_id, project_id, kind, filename, key),
+        (asset_id, project_id, kind, filename, key, _asset_created_at()),
     )
+
+
+def delete_asset(conn: Any, project_id: str, asset_id: str) -> tuple[str, list[str]] | None:
+    """Remove one uploaded file. Scenes that used it stay, without that photo.
+
+    Returns the storage key and any clip keys that are no longer referenced.
+    """
+    asset = get_asset(conn, project_id, asset_id)
+    if asset is None:
+        return None
+    rows = conn.execute(
+        db.sql("SELECT id FROM scenes WHERE project_id = ? AND asset_id = ?"),
+        (project_id, asset_id),
+    ).fetchall()
+    stale: list[str] = []
+    for row in rows:
+        key = clear_clip(conn, project_id, row["id"])
+        if key:
+            stale.append(key)
+        conn.execute(
+            db.sql("UPDATE scenes SET asset_id = NULL WHERE id = ? AND project_id = ?"),
+            (row["id"], project_id),
+        )
+    conn.execute(
+        db.sql("DELETE FROM assets WHERE id = ? AND project_id = ?"),
+        (asset_id, project_id),
+    )
+    if asset["kind"] == "logo":
+        conn.execute(
+            db.sql(
+                "UPDATE projects SET logo_asset_id = NULL, updated_at = {now}"
+                " WHERE id = ? AND logo_asset_id = ?"
+            ),
+            (project_id, asset_id),
+        )
+    if asset["kind"] == "audio":
+        remaining = conn.execute(
+            db.sql("SELECT COUNT(*) AS n FROM assets WHERE project_id = ? AND kind = 'audio'"),
+            (project_id,),
+        ).fetchone()["n"]
+        if int(remaining) == 0:
+            update_audio_settings(conn, project_id, enabled=False)
+    if rows or asset["kind"] == "audio":
+        invalidate_render(conn, project_id)
+    return asset["storage_key"], stale
 
 
 def get_asset(conn: Any, project_id: str, asset_id: str) -> dict | None:
@@ -413,6 +648,39 @@ def latest_audio(conn: Any, project_id: str) -> dict | None:
         (project_id,),
     ).fetchone()
     return dict(row) if row else None
+
+
+def release_scene_image(conn: Any, project_id: str, scene_id: str) -> tuple[str | None, str | None]:
+    """Take the photo off one scene. Delete the file only when nothing else uses it.
+
+    Returns the photo storage key, if it should be deleted, and the clip key.
+    """
+    scene = get_scene(conn, project_id, scene_id)
+    if scene is None:
+        raise LookupError("scene not found")
+    asset_id = scene.get("asset_id")
+    if not asset_id:
+        return None, None
+    stale = clear_clip(conn, project_id, scene_id)
+    conn.execute(
+        db.sql("UPDATE scenes SET asset_id = NULL WHERE id = ? AND project_id = ?"),
+        (scene_id, project_id),
+    )
+    others = conn.execute(
+        db.sql("SELECT COUNT(*) AS n FROM scenes WHERE project_id = ? AND asset_id = ?"),
+        (project_id, asset_id),
+    ).fetchone()["n"]
+    storage_key = None
+    if int(others) == 0:
+        asset = get_asset(conn, project_id, asset_id)
+        if asset is not None:
+            storage_key = asset["storage_key"]
+            conn.execute(
+                db.sql("DELETE FROM assets WHERE id = ? AND project_id = ?"),
+                (asset_id, project_id),
+            )
+    invalidate_render(conn, project_id)
+    return storage_key, stale
 
 
 def attach_asset_to_scene(conn: Any, project_id: str, scene_id: str, asset_id: str) -> None:

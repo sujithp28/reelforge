@@ -119,6 +119,85 @@ def test_update_scene_persists_and_resyncs_duration():
     assert updated["duration"] == updated["total_duration"], "duration drifted"
 
 
+def test_export_preset_sets_the_frame_and_rejects_unknown_formats():
+    bare = make_project()
+    assert bare["export_preset"] is None
+    assert bare["aspect_ratio"] == "9:16"
+
+    feed = client.post("/api/projects", json={
+        "idea": "a handmade leather wallet on oak",
+        "category": "Product",
+        "duration": 18,
+        "aspect_ratio": "16:9",
+        "export_preset": "instagram_feed",
+        "width": 999,
+        "height": 1,
+    })
+    assert feed.status_code == 201, feed.text
+    saved = feed.json()
+    assert saved["export_preset"] == "instagram_feed"
+    assert saved["aspect_ratio"] == "4:5"
+    assert "width" not in saved
+
+    rejected = client.post("/api/projects", json={
+        "idea": "x", "category": "Product", "duration": 18,
+        "aspect_ratio": "9:16", "export_preset": "tiktok",
+    })
+    assert rejected.status_code == 422, rejected.text
+
+    landscape = client.patch(
+        f"/api/projects/{saved['id']}/export",
+        json={"export_preset": "youtube_landscape"},
+    )
+    assert landscape.status_code == 200, landscape.text
+    assert landscape.json()["export_preset"] == "youtube_landscape"
+    assert landscape.json()["aspect_ratio"] == "16:9"
+
+    short = client.patch(
+        f"/api/projects/{bare['id']}/export",
+        json={"export_preset": "youtube_short"},
+    )
+    assert short.status_code == 200, short.text
+    assert short.json()["aspect_ratio"] == "9:16"
+    assert short.json()["export_preset"] == "youtube_short"
+
+    unknown = client.patch(
+        f"/api/projects/{bare['id']}/export",
+        json={"export_preset": "cinema"},
+    )
+    assert unknown.status_code == 422, unknown.text
+
+
+def test_scene_text_is_saved_without_replacing_the_beat_title():
+    project = make_project()
+    scene = project["scenes"][0]
+    assert scene["show_title"] is False
+    assert scene["text_title"] is None
+    res = client.patch(
+        f"/api/projects/{project['id']}/scenes/{scene['id']}",
+        json={
+            "text_title": "Modern Luxury Living",
+            "text_subtitle": "Designed for modern life",
+            "show_title": True,
+            "show_subtitle": True,
+        },
+    )
+    assert res.status_code == 200, res.text
+    edited = next(s for s in res.json()["scenes"] if s["id"] == scene["id"])
+    assert edited["title"] == scene["title"]
+    assert edited["text_title"] == "Modern Luxury Living"
+    assert edited["text_subtitle"] == "Designed for modern life"
+    assert edited["show_title"] is True and edited["show_subtitle"] is True
+    off = client.patch(
+        f"/api/projects/{project['id']}/scenes/{scene['id']}",
+        json={"show_title": False},
+    )
+    assert off.status_code == 200, off.text
+    hidden = next(s for s in off.json()["scenes"] if s["id"] == scene["id"])
+    assert hidden["show_title"] is False
+    assert hidden["text_title"] == "Modern Luxury Living"
+
+
 def test_update_scene_rejects_a_total_over_the_maximum():
     project = make_project(duration=120)
     scene = project["scenes"][0]
@@ -175,7 +254,40 @@ def test_regenerate_unknown_scene_is_404():
 
 # --- uploads ----------------------------------------------------------------
 
-def test_upload_image_attaches_to_every_bare_scene():
+def _upload_image_batch(project, count):
+    """Upload `count` photos. Only the last request finishes the batch."""
+    body = None
+    for index in range(count):
+        res = client.post(
+            f"/api/projects/{project['id']}/uploads",
+            params={"replan": "true" if index == count - 1 else "false"},
+            files={"file": (f"photo-{index}.png", PNG_1PX, "image/png")},
+        )
+        assert res.status_code == 201, res.text
+        body = res.json()
+    return body
+
+
+def _assert_one_scene_per_image(project, body, count):
+    scenes = sorted(body["scenes"], key=lambda scene: scene["position"])
+    images = [asset for asset in body["assets"] if asset["kind"] == "image"]
+    assert len(scenes) == count, [scene["title"] for scene in scenes]
+    assert len(images) == count
+    assert [scene["asset_id"] for scene in scenes] == [asset["id"] for asset in images]
+    assert len({scene["asset_id"] for scene in scenes}) == count
+    assert images[-1]["id"] not in [scene["asset_id"] for scene in scenes[:-1]]
+    assert sum(scene["duration"] for scene in scenes) == project["duration"]
+    assert body["total_duration"] == project["duration"]
+    assert scenes[0]["caption"] == project["idea"]
+    assert all(scene["caption"] is None for scene in scenes[1:])
+    assert all(scene["asset_url"] for scene in scenes)
+    if ffmpeg.ffmpeg_available():
+        assert body["status"] == "rendering", body.get("status")
+        assert body["job"]["status"] == "queued"
+    return scenes
+
+
+def test_upload_image_becomes_one_scene():
     project = make_project()
     res = client.post(
         f"/api/projects/{project['id']}/uploads",
@@ -185,84 +297,59 @@ def test_upload_image_attaches_to_every_bare_scene():
     body = res.json()
     assert len(body["assets"]) == 1
     assert body["assets"][0]["kind"] == "image"
-    assert all(s["asset_url"] for s in body["scenes"]), "still did not reach all scenes"
-    # URLs are opaque to the frontend but must be servable paths, not disk paths.
+    _assert_one_scene_per_image(project, body, 1)
     url = body["assets"][0]["url"]
     assert url.startswith(config.MEDIA_URL_PREFIX + "/uploads/"), url
     assert project["id"] in url
 
 
-def test_upload_targets_one_scene_when_named():
+def test_uploaded_image_counts_match_scene_counts():
+    """1, 3, 5 and 8 photos each become that many scenes. Nothing is repeated or dropped."""
+    for count in (1, 3, 5, 8):
+        project = make_project(
+            idea="sunset over the harbour",
+            category="Cinematic",
+            duration=30,
+            input_type="Image",
+        )
+        body = _upload_image_batch(project, count)
+        _assert_one_scene_per_image(project, body, count)
+
+
+def test_upload_targets_one_scene_when_the_batch_is_not_finished():
     project = make_project()
     scene = project["scenes"][2]
     res = client.post(
         f"/api/projects/{project['id']}/uploads",
-        params={"scene_id": scene["id"]},
+        params={"scene_id": scene["id"], "replan": "false"},
         files={"file": ("ref.png", PNG_1PX, "image/png")},
     )
     assert res.status_code == 201, res.text
     scenes = {s["id"]: s for s in res.json()["scenes"]}
     assert scenes[scene["id"]]["asset_url"]
     assert not scenes[project["scenes"][0]["id"]]["asset_url"]
+    assert res.json()["status"] == "draft"
 
 
-def test_four_images_assign_in_order_and_the_last_repeats():
-    """Four uploads on a five-scene reel stay on their scenes. The last image covers the close."""
+def test_manual_scene_reassignment_still_changes_one_scene():
     project = make_project(category="Cinematic", duration=30, input_type="Image")
     scenes = project["scenes"]
-    assert [s["title"] for s in scenes] == [
-        "Opening", "Main moment", "Detail", "Story beat", "Closing",
-    ]
-    assert sum(s["duration"] for s in scenes) == 30
-
-    asset_ids = []
-    body = None
-    for index, scene in enumerate(scenes[:4]):
-        res = client.post(
-            f"/api/projects/{project['id']}/uploads",
-            params={"scene_id": scene["id"]},
-            files={"file": (f"room-{index}.png", PNG_1PX, "image/png")},
-        )
-        assert res.status_code == 201, res.text
-        body = res.json()
-        asset_ids.append(next(s["asset_id"] for s in body["scenes"] if s["id"] == scene["id"]))
-
-    closing = next(s for s in body["scenes"] if s["id"] == scenes[4]["id"])
-    assert closing["asset_id"] is None, "a short image list must not invent a title card or copy the first photo"
-    assert {a["filename"] for a in body["assets"] if a["kind"] == "image"} == {
-        "room-0.png", "room-1.png", "room-2.png", "room-3.png",
-    }
-
-    assigned = client.put(
-        f"/api/projects/{project['id']}/scenes/{scenes[4]['id']}/asset",
-        json={"asset_id": asset_ids[3]},
-    )
-    assert assigned.status_code == 200, assigned.text
-    by_position = {s["position"]: s["asset_id"] for s in assigned.json()["scenes"]}
-    assert [by_position[i] for i in range(5)] == [
-        asset_ids[0], asset_ids[1], asset_ids[2], asset_ids[3], asset_ids[3],
-    ]
-    assert sum(s["duration"] for s in assigned.json()["scenes"]) == 30
-
-
-def test_changing_one_scene_image_leaves_the_others():
-    project = make_project(category="Cinematic", duration=30)
-    scenes = project["scenes"]
     asset_ids = []
     for index, scene in enumerate(scenes[:4]):
         res = client.post(
             f"/api/projects/{project['id']}/uploads",
-            params={"scene_id": scene["id"]},
+            params={"scene_id": scene["id"], "replan": "false"},
             files={"file": (f"room-{index}.png", PNG_1PX, "image/png")},
         )
         assert res.status_code == 201, res.text
         asset_ids.append(next(
             s["asset_id"] for s in res.json()["scenes"] if s["id"] == scene["id"]
         ))
-    client.put(
+    covered = client.put(
         f"/api/projects/{project['id']}/scenes/{scenes[4]['id']}/asset",
         json={"asset_id": asset_ids[3]},
     )
+    assert covered.status_code == 200, covered.text
 
     changed = client.put(
         f"/api/projects/{project['id']}/scenes/{scenes[0]['id']}/asset",
@@ -270,6 +357,7 @@ def test_changing_one_scene_image_leaves_the_others():
     )
     assert changed.status_code == 200, changed.text
     got = {s["id"]: s["asset_id"] for s in changed.json()["scenes"]}
+    assert len(got) == len(scenes)
     assert got[scenes[0]["id"]] == asset_ids[2]
     assert got[scenes[1]["id"]] == asset_ids[1]
     assert got[scenes[2]["id"]] == asset_ids[2]
@@ -337,16 +425,38 @@ def test_upload_over_the_size_limit_is_413():
 
 # --- audio settings ---------------------------------------------------------
 
+def _wav_bytes() -> bytes:
+    import io
+    import wave
+    tone = io.BytesIO()
+    with wave.open(tone, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(8000)
+        handle.writeframes(b"\x00\x00" * 1600)
+    return tone.getvalue()
+
+
 def test_audio_settings_round_trip():
     project = make_project()
+    assert project["music_enabled"] is False
+    assert project["music_fade_in"] == 1
     res = client.patch(
         f"/api/projects/{project['id']}/audio",
-        json={"music_volume": 0.35, "music_fade_out": 4},
+        json={"music_volume": 0.35, "music_fade_out": 4, "music_fade_in": 2, "music_enabled": True},
     )
     assert res.status_code == 200, res.text
     body = res.json()
     assert abs(body["music_volume"] - 0.35) < 1e-6
     assert body["music_fade_out"] == 4
+    assert body["music_fade_in"] == 2
+    assert body["music_enabled"] is True
+    again = client.get(f"/api/projects/{project['id']}")
+    assert again.status_code == 200
+    saved = again.json()
+    assert saved["music_enabled"] is True
+    assert saved["music_fade_in"] == 2
+    assert abs(saved["music_volume"] - 0.35) < 1e-6
 
     assert client.patch(
         f"/api/projects/{project['id']}/audio", json={}
@@ -354,19 +464,109 @@ def test_audio_settings_round_trip():
     assert client.patch(
         f"/api/projects/{project['id']}/audio", json={"music_volume": 9}
     ).status_code == 422
+    assert client.patch(
+        f"/api/projects/{project['id']}/audio", json={"music_fade_in": 11}
+    ).status_code == 422
 
 
 def test_audio_upload_is_stored_as_audio():
     project = make_project()
     res = client.post(
         f"/api/projects/{project['id']}/uploads",
-        files={"file": ("track.mp3", b"ID3fake-but-nonempty", "audio/mpeg")},
+        files={"file": ("track.wav", _wav_bytes(), "audio/wav")},
     )
     assert res.status_code == 201, res.text
-    kinds = [a["kind"] for a in res.json()["assets"]]
+    body = res.json()
+    kinds = [a["kind"] for a in body["assets"]]
     assert kinds == ["audio"]
     # Audio must not be attached to scenes as a still.
-    assert not any(s["asset_url"] for s in res.json()["scenes"])
+    assert not any(s["asset_url"] for s in body["scenes"])
+    assert body["music_enabled"] is True
+    assert body["assets"][0]["url"]
+
+
+def test_audio_upload_rejects_a_file_that_is_not_music():
+    project = make_project()
+    res = client.post(
+        f"/api/projects/{project['id']}/uploads",
+        files={"file": ("track.mp3", b"ID3fake-but-nonempty", "audio/mpeg")},
+    )
+    assert res.status_code == 422, res.text
+    detail = res.json()["detail"].lower()
+    for word in ("ffmpeg", "codec", "bitrate", "ffprobe"):
+        assert word not in detail
+    kept = client.get(f"/api/projects/{project['id']}").json()
+    assert kept["assets"] == []
+    assert kept["music_enabled"] is False
+
+
+def test_disabling_music_keeps_the_file_and_the_scene_clips():
+    project = make_project()
+    uploaded = client.post(
+        f"/api/projects/{project['id']}/uploads",
+        files={"file": ("track.wav", _wav_bytes(), "audio/wav")},
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    off = client.patch(
+        f"/api/projects/{project['id']}/audio",
+        json={"music_enabled": False},
+    )
+    assert off.status_code == 200, off.text
+    body = off.json()
+    assert body["music_enabled"] is False
+    assert [a["kind"] for a in body["assets"]] == ["audio"]
+    assert body["status"] == "draft"
+
+
+def test_legacy_project_with_music_stays_enabled_after_migration():
+    """A database from before the switch keeps music on, and a later off stays off."""
+    import sqlite3
+    import tempfile
+    from app import db
+
+    root = tempfile.mkdtemp(prefix="reelforge-music-mig-")
+    conn = sqlite3.connect(root + "/old.db")
+    conn.row_factory = sqlite3.Row
+    try:
+        for statement in db.SCHEMA:
+            conn.execute(db.sql(statement))
+        conn.execute(
+            "INSERT INTO projects (id, title, idea, category, input_type, duration,"
+            " aspect_ratio, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            ("keep", "t", "i", "Real Estate", "Idea", 30, "9:16", "t", "t"),
+        )
+        conn.execute(
+            "INSERT INTO projects (id, title, idea, category, input_type, duration,"
+            " aspect_ratio, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            ("quiet", "t", "i", "Real Estate", "Idea", 30, "9:16", "t", "t"),
+        )
+        conn.execute(
+            "INSERT INTO assets (id, project_id, kind, filename, storage_key, created_at)"
+            " VALUES (?,?,?,?,?,?)",
+            ("a1", "keep", "audio", "song.mp3", "uploads/keep/a1.mp3", "t"),
+        )
+        added = db._migrate(conn)
+        assert ("projects", "music_enabled") in added
+        keep = conn.execute(
+            "SELECT music_enabled, music_fade_in FROM projects WHERE id = 'keep'"
+        ).fetchone()
+        quiet = conn.execute(
+            "SELECT music_enabled FROM projects WHERE id = 'quiet'"
+        ).fetchone()
+        assert keep["music_enabled"] == 1
+        assert keep["music_fade_in"] == 1
+        assert quiet["music_enabled"] == 0
+        conn.execute("UPDATE projects SET music_enabled = 0 WHERE id = 'keep'")
+        again = db._migrate(conn)
+        assert ("projects", "music_enabled") not in again
+        stuck = conn.execute(
+            "SELECT music_enabled FROM projects WHERE id = 'keep'"
+        ).fetchone()
+        assert stuck["music_enabled"] == 0
+    finally:
+        conn.close()
+        import shutil
+        shutil.rmtree(root, ignore_errors=True)
 
 
 # --- rendering: jobs are separate from the request -------------------------
@@ -529,6 +729,28 @@ def test_storage_keys_are_relative_and_traversal_is_refused():
         pass
     else:
         raise AssertionError("a traversing storage key was accepted")
+
+
+def test_browser_download_reads_the_project_file_and_not_a_downloads_folder():
+    """The website only offers the project file. It does not write to Downloads."""
+    project = make_project()
+    payload = b"\x00\x00\x00\x18ftypisom" + b"\x00" * 32
+    key = storage.render_key(project["id"])
+    storage.storage.save_bytes(key, payload)
+    from app import db
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE projects SET video_key = ?, status = ?, output_stale = 0 WHERE id = ?",
+            (key, "ready", project["id"]),
+        )
+    body = client.get(f"/api/projects/{project['id']}").json()
+    assert body["video_url"] == f"/media/{key}"
+    assert "downloads" not in body
+    fetched = client.get(body["video_url"])
+    assert fetched.status_code == 200
+    assert fetched.content == payload
+    outside = client.get("/media/../reelforge.db")
+    assert outside.status_code in (404, 400)
 
 
 def test_storage_round_trip():
@@ -769,19 +991,484 @@ def test_music_mux_command_uses_the_audio_settings():
         video="v.mp4", music="m.mp3", out="o.mp4",
         total_seconds=30, volume=0.25, fade_out=3,
     )
-    af = cmd[cmd.index("-af") + 1]
-    assert "volume=0.250" in af, af
-    assert "afade=t=out:st=27:d=3" in af, af
-    assert af.endswith("apad"), af
-    assert "-shortest" in cmd
+    graph = cmd[cmd.index("-filter_complex") + 1]
+    assert "volume=0.250" in graph, graph
+    assert "afade=t=in:st=0:d=1.000" in graph, graph
+    assert "afade=t=out:st=27.000:d=3" in graph, graph
+    assert "atrim=end=30.000" in graph and "apad" in graph
+    assert "-shortest" not in cmd
+    assert cmd[cmd.index("-t") + 1] == "30.000"
     assert cmd[cmd.index("-c:v") + 1] == "copy", "video must not be re-encoded"
+
+    custom = ffmpeg.build_music_mux_cmd(
+        video="v.mp4", music="m.mp3", out="o.mp4",
+        total_seconds=30, volume=1.0, fade_out=2, fade_in=0.8,
+    )
+    custom_graph = custom[custom.index("-filter_complex") + 1]
+    assert "afade=t=in:st=0:d=0.800" in custom_graph
 
     # A fade longer than the reel would produce a negative start time.
     short = ffmpeg.build_music_mux_cmd(
         video="v.mp4", music="m.mp3", out="o.mp4",
         total_seconds=2, volume=1.0, fade_out=5,
     )
-    assert "afade" not in short[short.index("-af") + 1]
+    assert "afade" not in short[short.index("-filter_complex") + 1]
+
+
+def test_reorder_keeps_titles_with_their_photos():
+    project = make_project()
+    scenes = project["scenes"]
+    assert len(scenes) >= 2
+    first, second = scenes[0], scenes[1]
+    titled = client.patch(
+        f"/api/projects/{project['id']}/scenes/{first['id']}",
+        json={"text_title": "Living room", "show_title": True},
+    )
+    assert titled.status_code == 200, titled.text
+    titled = client.patch(
+        f"/api/projects/{project['id']}/scenes/{second['id']}",
+        json={"text_title": "Kitchen", "show_title": True, "text_subtitle": "Morning light", "show_subtitle": True},
+    )
+    assert titled.status_code == 200, titled.text
+    for scene, name in ((first, "living.png"), (second, "kitchen.png")):
+        uploaded = client.post(
+            f"/api/projects/{project['id']}/uploads",
+            files={"file": (name, PNG_1PX, "image/png")},
+            params={"scene_id": scene["id"], "replan": "false"},
+        )
+        assert uploaded.status_code == 201, uploaded.text
+    current = client.get(f"/api/projects/{project['id']}").json()
+    by_id = {scene["id"]: scene for scene in current["scenes"]}
+    ids = [scene["id"] for scene in current["scenes"]]
+    ids[0], ids[1] = ids[1], ids[0]
+    moved = client.put(
+        f"/api/projects/{project['id']}/scenes/order",
+        json={"scene_ids": ids},
+    )
+    assert moved.status_code == 200, moved.text
+    body = moved.json()
+    assert [scene["id"] for scene in body["scenes"]] == ids
+    assert body["scenes"][0]["text_title"] == by_id[ids[0]]["text_title"]
+    assert body["scenes"][0]["text_subtitle"] == by_id[ids[0]]["text_subtitle"]
+    assert body["scenes"][0]["asset_id"] == by_id[ids[0]]["asset_id"]
+    assert body["output_stale"] is True
+    assert body["music_enabled"] == current["music_enabled"]
+    assert body["music_volume"] == current["music_volume"]
+    rejected = client.put(
+        f"/api/projects/{project['id']}/scenes/order",
+        json={"scene_ids": ids[:1]},
+    )
+    assert rejected.status_code == 422
+
+
+def test_removing_a_photo_keeps_the_scene_and_the_previous_reel():
+    from app import db
+
+    project = make_project()
+    scene = project["scenes"][0]
+    uploaded = client.post(
+        f"/api/projects/{project['id']}/uploads",
+        files={"file": ("room.png", PNG_1PX, "image/png")},
+        params={"scene_id": scene["id"], "replan": "false"},
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE projects SET video_key = ?, status = ?, output_stale = 0 WHERE id = ?",
+            ("renders/keep.mp4", "ready", project["id"]),
+        )
+    removed = client.delete(f"/api/projects/{project['id']}/scenes/{scene['id']}/asset")
+    assert removed.status_code == 200, removed.text
+    body = removed.json()
+    kept = next(item for item in body["scenes"] if item["id"] == scene["id"])
+    assert kept["asset_id"] is None
+    assert kept["text_title"] == scene["text_title"]
+    assert body["video_url"].endswith("renders/keep.mp4")
+    assert body["output_stale"] is True
+    assert len(body["scenes"]) == len(project["scenes"])
+
+
+def test_failed_render_keeps_the_previous_reel():
+    from app import db, repo
+
+    project = make_project()
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE projects SET video_key = ?, status = ?, output_stale = 0 WHERE id = ?",
+            ("renders/keep.mp4", "ready", project["id"]),
+        )
+        repo.mark_failed(conn, project["id"], "The reel could not be finished.")
+    body = client.get(f"/api/projects/{project['id']}").json()
+    assert body["status"] == "failed"
+    assert body["error"] == "The reel could not be finished."
+    assert body["video_url"].endswith("renders/keep.mp4")
+
+
+def test_rename_does_not_mark_the_reel_stale():
+    from app import db
+
+    project = make_project()
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE projects SET video_key = ?, status = ?, output_stale = 0 WHERE id = ?",
+            ("renders/keep.mp4", "ready", project["id"]),
+        )
+    renamed = client.patch(f"/api/projects/{project['id']}", json={"title": "Harbour house"})
+    assert renamed.status_code == 200, renamed.text
+    body = renamed.json()
+    assert body["title"] == "Harbour house"
+    assert body["status"] == "ready"
+    assert body["output_stale"] is False
+    assert body["video_url"].endswith("renders/keep.mp4")
+    blank = client.patch(f"/api/projects/{project['id']}", json={"title": "   "})
+    assert blank.status_code == 422
+
+
+def test_add_and_remove_scene_keeps_music_and_the_other_scenes():
+    project = make_project()
+    music = client.post(
+        f"/api/projects/{project['id']}/uploads",
+        files={"file": ("tone.wav", _wav_bytes(), "audio/wav")},
+    )
+    assert music.status_code == 201, music.text
+    before = music.json()
+    added = client.post(f"/api/projects/{project['id']}/scenes", json={})
+    assert added.status_code == 201, added.text
+    body = added.json()
+    assert len(body["scenes"]) == len(before["scenes"]) + 1
+    assert body["music_enabled"] is True
+    assert body["music_volume"] == before["music_volume"]
+    extra = body["scenes"][-1]
+    assert extra["title"].startswith("Scene")
+    removed = client.delete(f"/api/projects/{project['id']}/scenes/{extra['id']}")
+    assert removed.status_code == 200, removed.text
+    after = removed.json()
+    assert len(after["scenes"]) == len(before["scenes"])
+    assert [scene["id"] for scene in after["scenes"]] == [scene["id"] for scene in before["scenes"]]
+    assert after["music_enabled"] is True
+    body = after
+    while len(body["scenes"]) > 2:
+        last = body["scenes"][-1]
+        if body["total_duration"] - last["duration"] < 5:
+            break
+        deleted = client.delete(f"/api/projects/{project['id']}/scenes/{last['id']}")
+        assert deleted.status_code == 200, deleted.text
+        body = deleted.json()
+    assert len(body["scenes"]) == 2, [scene["duration"] for scene in body["scenes"]]
+    for scene in sorted(body["scenes"], key=lambda item: item["duration"]):
+        edited = client.patch(
+            f"/api/projects/{project['id']}/scenes/{scene['id']}",
+            json={"duration": 3},
+        )
+        assert edited.status_code == 200, edited.text
+    blocked = client.delete(
+        f"/api/projects/{project['id']}/scenes/{body['scenes'][1]['id']}"
+    )
+    assert blocked.status_code == 422, blocked.text
+    still = client.get(f"/api/projects/{project['id']}").json()
+    assert any(scene["id"] == body["scenes"][1]["id"] for scene in still["scenes"])
+    assert still["music_enabled"] is True
+
+
+def test_append_photo_adds_a_scene_without_replacing_the_others():
+    project = make_project()
+    original = [scene["id"] for scene in project["scenes"]]
+    added = client.post(
+        f"/api/projects/{project['id']}/uploads",
+        files={"file": ("extra.png", PNG_1PX, "image/png")},
+        params={"append": "true", "replan": "false"},
+    )
+    assert added.status_code == 201, added.text
+    body = added.json()
+    assert [scene["id"] for scene in body["scenes"][:-1]] == original
+    assert body["scenes"][-1]["asset_url"]
+    assert body["output_stale"] is True
+
+
+def test_export_preset_frames_match_the_studio():
+    from app import export_presets
+
+    expected = {
+        "instagram_reel": ("9:16", 1080, 1920, 30, "Instagram Reel"),
+        "youtube_short": ("9:16", 1080, 1920, 30, "YouTube Short"),
+        "instagram_feed": ("4:5", 1080, 1350, 30, "Instagram Feed"),
+        "youtube_landscape": ("16:9", 1920, 1080, 30, "YouTube"),
+    }
+    assert set(export_presets.PRESETS) == set(expected)
+    for preset_id, (ratio, width, height, fps, label) in expected.items():
+        preset = export_presets.PRESETS[preset_id]
+        assert (preset.aspect_ratio, preset.width, preset.height, preset.fps, preset.label) == (
+            ratio, width, height, fps, label,
+        )
+        assert "1080" not in preset.label
+        assert "H.264" not in preset.label
+
+
+def test_save_file_replaces_without_dropping_the_previous_file_on_a_failed_write(tmp_path=None):
+    """A finished replace swaps the file. The previous bytes survive until then."""
+    from pathlib import Path
+    from app import storage
+
+    root = Path(_TMP) / "replace-check"
+    root.mkdir(exist_ok=True)
+    local = storage.LocalStorage(root)
+    previous = root / "src-old.mp4"
+    previous.write_bytes(b"old-reel")
+    local.save_file("renders/proj.mp4", previous)
+    assert (root / "renders" / "proj.mp4").read_bytes() == b"old-reel"
+    nxt = root / "src-new.mp4"
+    nxt.write_bytes(b"new-reel")
+    local.save_file("renders/proj.mp4", nxt)
+    assert (root / "renders" / "proj.mp4").read_bytes() == b"new-reel"
+    assert not (root / "renders" / "proj.mp4.partial").exists()
+
+
+def test_luxury_interiors_creates_five_scenes_and_both_scripts():
+    project = make_project(
+        idea="a quiet living room at dusk",
+        category="Luxury Interiors",
+        duration=30,
+        language="te",
+        brand_name="North Room",
+    )
+    assert len(project["scenes"]) == 5
+    assert [scene["title"] for scene in project["scenes"]] == [
+        "Opening hook", "Interior inspiration", "Design detail",
+        "Practical idea", "Branded close",
+    ]
+    assert sum(scene["duration"] for scene in project["scenes"]) == 30
+    assert project["export_preset"] == "instagram_reel"
+    assert project["aspect_ratio"] == "9:16"
+    assert project["music_enabled"] is False
+    assert project["brand_name"] == "North Room"
+    script = project["content_script"]
+    assert script["template"] == "luxury_interiors"
+    assert script["language"] == "te"
+    assert len(script["english"]["scenes"]) == 5
+    assert len(script["telugu"]["scenes"]) == 5
+    assert script["instagram_caption"]
+    assert script["youtube_description"]
+    assert script["hashtags"]
+    assert project["scenes"][0]["text_title"]
+    assert project["scenes"][4]["text_title"] == "North Room"
+    from app.luxury import contains_invented_claim
+    assert contains_invented_claim(script) is None
+    plain = make_project()
+    assert plain["content_script"] is None
+
+
+def test_luxury_script_edits_persist_and_other_projects_refuse_them():
+    project = make_project(
+        idea="morning light", category="Luxury Interiors", duration=30,
+    )
+    assert project["brand_name"] == "Luxury Living Studio"
+    english = project["content_script"]["english"]
+    english["hook"] = "Start with the room"
+    english["scenes"][0]["title"] = "Open with light"
+    english["cta"] = "Save this idea"
+    saved = client.put(f"/api/projects/{project['id']}/luxury-script", json={
+        "language": "en",
+        "english": english,
+        "instagram_caption": "A calm idea for these pictures.",
+        "youtube_description": "A short idea.\nNo prices.",
+        "hashtags": ["#QuietRooms"],
+        "apply_to_scenes": True,
+    })
+    assert saved.status_code == 200, saved.text
+    body = saved.json()
+    assert body["scenes"][0]["text_title"] == "Open with light"
+    assert body["content_script"]["instagram_caption"] == "A calm idea for these pictures."
+    assert body["content_script"]["english"]["hook"] == "Start with the room"
+    assert body["content_script"]["telugu"]["scenes"]
+    other = make_project()
+    refused = client.put(
+        f"/api/projects/{other['id']}/luxury-script",
+        json={"topic": "morning light"},
+    )
+    assert refused.status_code == 422
+
+
+def test_luxury_reuses_an_existing_image_and_keeps_the_five_scenes():
+    project = make_project(
+        idea="evening room", category="Luxury Interiors", duration=30,
+    )
+    titles = [scene["text_title"] for scene in project["scenes"]]
+    for index in range(3):
+        replan = "true" if index == 2 else "false"
+        uploaded = client.post(
+            f"/api/projects/{project['id']}/uploads?replan={replan}",
+            files={"file": (f"room{index}.png", PNG_1PX, "image/png")},
+        )
+        assert uploaded.status_code == 201, uploaded.text
+    body = uploaded.json()
+    assert len(body["scenes"]) == 5
+    assert [scene["text_title"] for scene in body["scenes"]] == titles
+    assert body["status"] == "draft"
+    images = [asset for asset in body["assets"] if asset["kind"] == "image"]
+    assert len(images) == 3
+    assert [scene["asset_id"] for scene in body["scenes"][:3]] == [item["id"] for item in images]
+    assert body["scenes"][3]["asset_id"] is None
+    scene_id = body["scenes"][3]["id"]
+    assigned = client.put(
+        f"/api/projects/{project['id']}/scenes/{scene_id}/asset",
+        json={"asset_id": images[0]["id"]},
+    )
+    assert assigned.status_code == 200, assigned.text
+    again = assigned.json()
+    assert len([asset for asset in again["assets"] if asset["kind"] == "image"]) == 3
+    assert again["scenes"][3]["asset_id"] == images[0]["id"]
+    assert again["scenes"][0]["asset_id"] == images[0]["id"]
+
+
+def test_luxury_logo_is_not_placed_on_a_scene():
+    project = make_project(
+        idea="evening room", category="Luxury Interiors", duration=30,
+    )
+    before = [scene["asset_id"] for scene in project["scenes"]]
+    logo = client.post(
+        f"/api/projects/{project['id']}/logo",
+        files={"file": ("mark.png", PNG_1PX, "image/png")},
+    )
+    assert logo.status_code == 201, logo.text
+    body = logo.json()
+    assert body["logo_url"]
+    assert [scene["asset_id"] for scene in body["scenes"]] == before
+    assert [asset["kind"] for asset in body["assets"]] == ["logo"]
+    assert body["output_stale"] is False
+
+
+def test_luxury_image_prompts_are_five_local_cards():
+    project = make_project(
+        idea="a quiet living room at dusk",
+        category="Luxury Interiors",
+        duration=30,
+        language="en",
+    )
+    prompts = project["content_script"]["image_prompts"]
+    assert prompts["format"].startswith("Portrait 9:16")
+    assert prompts["instruction"].startswith("Copy each prompt and generate its image")
+    assert len(prompts["scenes"]) == 5
+    assert [scene["role"] for scene in prompts["scenes"]] == [
+        "Opening hook", "Interior inspiration", "Design details",
+        "Practical idea", "Branded close",
+    ]
+    assert all("quiet living room" in scene["prompt"] for scene in prompts["scenes"])
+    assert all("9:16" in scene["prompt"] for scene in prompts["scenes"])
+    assert all("no watermark" in scene["prompt"] for scene in prompts["scenes"])
+    assert "luxury home" in prompts["scenes"][0]["prompt"]
+    assert "living room" in prompts["scenes"][1]["prompt"]
+    assert "marble" in prompts["scenes"][2]["prompt"]
+    assert "practical" in prompts["scenes"][3]["prompt"].lower()
+    assert "brand ending" in prompts["scenes"][4]["prompt"]
+    from app.luxury import contains_invented_claim
+    assert contains_invented_claim(project["content_script"]) is None
+    claimed = json.loads(json.dumps(project["content_script"]))
+    claimed["english"]["scenes"][0]["title"] = "Italian marble"
+    assert contains_invented_claim(claimed) == "marble"
+    telugu = make_project(
+        idea="a quiet living room at dusk",
+        category="Luxury Interiors",
+        duration=30,
+        language="te",
+    )
+    telugu_prompt = telugu["content_script"]["image_prompts"]["scenes"][0]["prompt"]
+    assert "9:16" in telugu_prompt
+    assert "గది" in telugu_prompt
+    original = prompts["scenes"][0]["prompt"]
+    kept = prompts["scenes"][1]["prompt"]
+    saved = client.put(f"/api/projects/{project['id']}/luxury-script", json={
+        "regenerate_image_prompt": 0,
+        "apply_to_scenes": False,
+    })
+    assert saved.status_code == 200, saved.text
+    body = saved.json()
+    changed = body["content_script"]["image_prompts"]["scenes"]
+    assert changed[0]["prompt"] != original
+    assert changed[1]["prompt"] == kept
+    assert body["scenes"][0]["text_title"] == project["scenes"][0]["text_title"]
+    edited = body["content_script"]["image_prompts"]
+    edited["scenes"][2]["prompt"] = "Custom portrait prompt for scene three, 9:16."
+    again = client.put(f"/api/projects/{project['id']}/luxury-script", json={
+        "image_prompts": edited,
+        "apply_to_scenes": False,
+    })
+    assert again.status_code == 200, again.text
+    assert again.json()["content_script"]["image_prompts"]["scenes"][2]["prompt"].startswith(
+        "Custom portrait"
+    )
+    scene = project["scenes"][2]
+    uploaded = client.post(
+        f"/api/projects/{project['id']}/uploads?scene_id={scene['id']}&replan=false",
+        files={"file": ("detail.png", PNG_1PX, "image/png")},
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    assigned = uploaded.json()
+    assert len(assigned["scenes"]) == 5
+    assert assigned["scenes"][2]["asset_id"]
+    assert assigned["scenes"][0]["asset_id"] is None
+    assert assigned["scenes"][1]["asset_id"] is None
+    plain = make_project()
+    assert plain["content_script"] is None
+    assert plain["category"] == "Product"
+
+
+def test_luxury_image_generation_stays_off():
+    body = client.get("/api/luxury/capabilities").json()
+    assert body["available"] is False
+    assert body["message"].startswith("Copy each prompt and generate its image")
+
+
+def test_luxury_render_requires_each_scene_image():
+    if not ffmpeg.ffmpeg_available():
+        print("  (skipped luxury render test: ffmpeg not on PATH)")
+        return
+    project = make_project(
+        idea="a quiet hallway", category="Luxury Interiors", duration=10,
+    )
+    blocked = client.post(f"/api/projects/{project['id']}/render", json={})
+    assert blocked.status_code == 422, blocked.text
+    assert "Scenes 1, 2, 3, 4, 5" in blocked.json()["detail"]
+    assert "before rendering" in blocked.json()["detail"]
+
+    first_id = None
+    for scene in project["scenes"]:
+        uploaded = client.post(
+            f"/api/projects/{project['id']}/uploads?scene_id={scene['id']}&replan=false",
+            files={"file": (f"{scene['position']}.png", PNG_1PX, "image/png")},
+        )
+        assert uploaded.status_code == 201, uploaded.text
+        project = uploaded.json()
+        if first_id is None:
+            first_id = project["scenes"][0]["asset_id"]
+    assert all(scene["asset_id"] for scene in project["scenes"])
+    images = [asset for asset in project["assets"] if asset["kind"] == "image"]
+    assert len(images) == 5
+
+    replaced = client.post(
+        f"/api/projects/{project['id']}/uploads?scene_id={project['scenes'][0]['id']}&replan=false",
+        files={"file": ("replacement.png", PNG_1PX, "image/png")},
+    )
+    assert replaced.status_code == 201, replaced.text
+    project = replaced.json()
+    assert project["scenes"][0]["asset_id"] != first_id
+    library = [asset["id"] for asset in project["assets"] if asset["kind"] == "image"]
+    assert first_id in library
+    assert len(library) == 6
+    reused = client.put(
+        f"/api/projects/{project['id']}/scenes/{project['scenes'][0]['id']}/asset",
+        json={"asset_id": first_id},
+    )
+    assert reused.status_code == 200, reused.text
+    project = reused.json()
+    assert project["scenes"][0]["asset_id"] == first_id
+    assert len([asset for asset in project["assets"] if asset["kind"] == "image"]) == 6
+
+    res = client.post(f"/api/projects/{project['id']}/render", json={})
+    assert res.status_code == 202, res.text
+    body = res.json()
+    assert body["status"] == "rendering"
+    job = client.get(f"/api/projects/{project['id']}/jobs/{body['job_id']}").json()
+    assert job["status"] == "queued"
 
 
 def demo():

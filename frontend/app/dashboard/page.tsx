@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { AlertTriangle, Loader2, Play, Plus, Trash2 } from "lucide-react";
-import { api, type ProjectSummary } from "../../lib/api";
+import { api, exportFormatLabel, mediaUrl, selectedExportFormat, type ProjectSummary } from "../../lib/api";
 
 const STATUS_STYLES: Record<string, string> = {
   draft: "border-zinc-700 text-zinc-400",
@@ -48,14 +48,14 @@ export default function Dashboard() {
   }
 
   return (
-    <main className="min-h-screen bg-zinc-950 px-6 py-8">
+    <main className="min-h-screen bg-zinc-950 px-4 py-8 sm:px-6">
       <div className="mx-auto max-w-7xl">
         <header className="flex items-center justify-between">
           <div>
             <Link href="/" className="text-xl font-bold">REEL<span className="text-violet-400">FORGE</span></Link>
             <p className="mt-2 text-sm text-zinc-500">Your workspace</p>
           </div>
-          <Link href="/create" className="flex items-center gap-2 rounded-xl bg-violet-500 px-5 py-3 text-sm font-semibold hover:bg-violet-400"><Plus size={17}/> New Reel</Link>
+          <Link href="/create" className="flex items-center gap-2 rounded-xl bg-violet-500 px-4 py-3 text-sm font-semibold hover:bg-violet-400 sm:px-5"><Plus size={17}/> New Reel</Link>
         </header>
 
         <section className="mt-12">
@@ -83,7 +83,10 @@ export default function Dashboard() {
           {!!projects?.length && (
             <div className="mt-7 grid gap-3">
               {projects.map(p => (
-                <div key={p.id} className="flex flex-wrap items-center gap-4 rounded-2xl border border-zinc-800 bg-zinc-900 p-5">
+                <div key={p.id} className="flex flex-wrap items-center gap-4 rounded-2xl border border-zinc-800 bg-zinc-900 p-4 sm:p-5">
+                  {p.cover_url && (
+                    <img src={mediaUrl(p.cover_url) ?? ""} alt="" className="h-16 w-12 shrink-0 rounded-lg object-cover" />
+                  )}
                   <Link href={`/projects/${p.id}`} className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-3">
                       <h2 className="truncate font-semibold">{p.title}</h2>
@@ -92,7 +95,9 @@ export default function Dashboard() {
                       </span>
                     </div>
                     <p className="mt-1.5 text-sm text-zinc-500">
-                      {p.category} · {p.aspect_ratio} · {p.duration}s · {p.scene_count} scenes
+                      {p.category}
+                      {exportFormatLabel(selectedExportFormat(p) || null) ? ` · ${exportFormatLabel(selectedExportFormat(p) || null)}` : ""}
+                      {` · ${p.duration}s · ${p.scene_count} scenes`}
                     </p>
                   </Link>
                   <div className="flex items-center gap-2">

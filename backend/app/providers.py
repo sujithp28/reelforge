@@ -5,8 +5,9 @@ A provider turns one scene into one video clip on disk. Everything downstream
 not care which provider produced the clips — that is the point of the seam.
 
   mock  the working local renderer: a Ken Burns move over an uploaded still,
-        or a typographic colour card when a scene has no still. No GPU, no
-        network, no credentials. Remains the default.
+        or a typographic colour card when a scene has no assigned still. An
+        assigned image that is not on disk is an error, not a title card.
+        No GPU, no network, no credentials. Remains the default.
   ltx   real AI generation through the LTX hosted API. Implemented in ltx.py;
         reports itself unavailable until an endpoint and key are configured.
         Paid, and kept available as an option.
@@ -52,6 +53,10 @@ class SceneSpec:
     # Customer-facing quality only: "standard" or "high". Providers map this
     # to their own settings; no model-specific parameter reaches this struct.
     quality: str = "standard"
+    # Resolved on-screen lines. Empty when the customer has not enabled them.
+    # These are not the scene's beat title and not the project idea.
+    text_title: str | None = None
+    text_subtitle: str | None = None
 
 
 
@@ -77,19 +82,25 @@ class MockGenerator:
 
     def generate(self, spec: SceneSpec, out: Path) -> None:
         image = spec.image_path
-        if image and Path(image).exists():
-            log.info("scene %s ffmpeg still %s", spec.scene_id, image)
-            cmd = build_still_clip_cmd(
-                image=str(image), out=str(out), seconds=spec.seconds,
-                width=spec.width, height=spec.height, caption=spec.caption,
-                index=spec.index,
-            )
-        else:
-            log.info("scene %s ffmpeg card image=%s", spec.scene_id, image or "none")
+        if image is None:
+            log.info("scene %s ffmpeg card image=none", spec.scene_id)
             cmd = build_card_clip_cmd(
                 out=str(out), seconds=spec.seconds, width=spec.width,
                 height=spec.height, caption=spec.caption or spec.title,
-                index=spec.index,
+                index=spec.index, fps=spec.fps,
+            )
+        else:
+            path = Path(image)
+            if not path.is_file():
+                raise RenderError(
+                    f"scene {spec.scene_id} has an assigned image that is missing: {path}"
+                )
+            log.info("scene %s ffmpeg still %s", spec.scene_id, path)
+            cmd = build_still_clip_cmd(
+                image=str(path), out=str(out), seconds=spec.seconds,
+                width=spec.width, height=spec.height, caption=None,
+                index=spec.index, fps=spec.fps,
+                text_title=spec.text_title, text_subtitle=spec.text_subtitle,
             )
         run(cmd)
 

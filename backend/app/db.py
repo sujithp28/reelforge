@@ -165,7 +165,19 @@ MIGRATIONS = [
     ("scenes", "clip_error", "TEXT"),
     ("scenes", "clip_attempts", "INTEGER NOT NULL DEFAULT 0"),
     ("scenes", "clip_provider", "TEXT"),
+    ("scenes", "text_title", "TEXT"),
+    ("scenes", "text_subtitle", "TEXT"),
+    ("scenes", "show_title", "INTEGER NOT NULL DEFAULT 0"),
+    ("scenes", "show_subtitle", "INTEGER NOT NULL DEFAULT 0"),
+    ("projects", "export_preset", "TEXT"),
     ("render_jobs", "cancel_requested", "INTEGER NOT NULL DEFAULT 0"),
+    ("projects", "music_enabled", "INTEGER NOT NULL DEFAULT 0"),
+    ("projects", "music_fade_in", "INTEGER NOT NULL DEFAULT 1"),
+    # 1 when the saved MP4 no longer matches the storyboard. The file stays.
+    ("projects", "output_stale", "INTEGER NOT NULL DEFAULT 0"),
+    ("projects", "brand_name", "TEXT"),
+    ("projects", "content_script", "TEXT"),
+    ("projects", "logo_asset_id", "TEXT"),
 ]
 
 
@@ -224,10 +236,25 @@ def init() -> None:
     with connect() as conn:
         for statement in SCHEMA:
             conn.execute(sql(statement))
-        for table, column, coltype in MIGRATIONS:
-            if column not in _existing_columns(conn, table):
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+        _migrate(conn)
         _backfill_storage_keys(conn)
+
+
+def _migrate(conn: Any) -> list[tuple[str, str]]:
+    """Add missing columns. Enabling music runs only the first time that column appears."""
+    added: list[tuple[str, str]] = []
+    for table, column, coltype in MIGRATIONS:
+        if column not in _existing_columns(conn, table):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+            added.append((table, column))
+    if ("projects", "music_enabled") in added:
+        # A project that already had a track was using it. A later switch-off
+        # must survive the next startup, so this update does not run again.
+        conn.execute(
+            "UPDATE projects SET music_enabled = 1"
+            " WHERE id IN (SELECT project_id FROM assets WHERE kind = 'audio')"
+        )
+    return added
 
 
 def _backfill_storage_keys(conn: Any) -> None:

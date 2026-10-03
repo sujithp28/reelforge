@@ -500,8 +500,11 @@ def test_one_failed_scene_does_not_discard_the_others():
             generator=generator, hooks=hooks,
         )
     except render.SceneGenerationError as exc:
-        # The customer-facing message names the scene, not a stack trace.
+        # The customer-facing message names the scene, not the encoder.
         assert "Scene 2" in str(exc), str(exc)
+        assert "Please try again." in str(exc)
+        assert "video service" not in str(exc)
+        assert "ffmpeg" not in str(exc).lower()
         assert len(exc.failures) == 1
         assert exc.failures[0].index == 1
     else:
@@ -569,6 +572,81 @@ def test_fingerprint_changes_only_when_the_pixels_would():
         assert render.scene_fingerprint(changed, "ltx") != same, field
     # So does switching provider.
     assert render.scene_fingerprint(base, "mock") != same
+
+
+def test_zero_music_volume_stays_zero():
+    from app.jobs import _music_volume
+
+    assert _music_volume({"music_volume": 0.0}) == 0.0
+    assert _music_volume({"music_volume": 0}) == 0.0
+    assert _music_volume({}) == 0.8
+    assert _music_volume({"music_volume": None}) == 0.8
+    assert abs(_music_volume({"music_volume": 0.35}) - 0.35) < 1e-9
+    source = Path(__file__).resolve().parent.joinpath("app", "jobs.py").read_text(encoding="utf-8")
+    assert "volume=_music_volume(project)" in source
+    assert "or 0.8" not in source
+
+
+def test_missing_assigned_image_is_not_a_title_card():
+    missing = TMP / "assigned-gone.jpg"
+    out = TMP / "missing-image.mp4"
+    spec = SceneSpec(
+        scene_id="s-missing", index=0, title="Room", prompt="p", caption="Room",
+        seconds=2, width=1080, height=1920, image_path=missing,
+    )
+    try:
+        providers.MockGenerator().generate(spec, out)
+    except RenderError as exc:
+        assert "assigned image that is missing" in str(exc)
+        assert str(missing) in str(exc)
+    else:
+        raise AssertionError("a missing assigned image was rendered as a title card")
+    assert not out.exists()
+
+    present = TMP / "assigned.jpg"
+    present.write_bytes(b"present")
+    seen: list[list[str]] = []
+    original = providers.run
+
+    def capture(cmd):
+        seen.append(list(cmd))
+
+    providers.run = capture
+    try:
+        providers.MockGenerator().generate(
+            SceneSpec(
+                scene_id="s-still", index=0, title="Room", prompt="p", caption=None,
+                seconds=2, width=1080, height=1920, image_path=present,
+            ),
+            TMP / "still.mp4",
+        )
+        providers.MockGenerator().generate(
+            SceneSpec(
+                scene_id="s-card", index=1, title="Card", prompt="p", caption="Card",
+                seconds=2, width=1080, height=1920, image_path=None,
+            ),
+            TMP / "card.mp4",
+        )
+    finally:
+        providers.run = original
+    assert "lavfi" not in seen[0], seen[0]
+    assert str(present) in seen[0]
+    assert "lavfi" in seen[1], seen[1]
+
+
+def test_mock_quality_choice_is_explained_and_real_providers_keep_it():
+    frontend = Path(__file__).resolve().parents[1] / "frontend"
+    api = (frontend / "lib" / "api.ts").read_text(encoding="utf-8")
+    create = (frontend / "app" / "create" / "page.tsx").read_text(encoding="utf-8")
+    project = (frontend / "app" / "projects" / "[id]" / "page.tsx").read_text(encoding="utf-8")
+    assert "This preview is built with FFmpeg" in api
+    assert "this renderer does not generate AI video" in api
+    assert 'videoProvider === "mock"' in create
+    assert "MOCK_QUALITY_NOTE" in create
+    assert "QUALITIES.map" in create
+    assert 'videoProvider === "mock"' in project
+    assert "MOCK_QUALITY_NOTE" in project
+    assert "api.updateQuality" in project
 
 
 def test_cancellation_stops_between_scenes():

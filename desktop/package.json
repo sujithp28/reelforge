@@ -1,0 +1,39 @@
+{
+  "name": "reelforge-desktop",
+  "private": true,
+  "version": "3.8.0",
+  "description": "ReelForge for Windows",
+  "main": "main.js",
+  "author": "ReelForge",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --win dir",
+    "dist": "electron-builder --win nsis"
+  },
+  "build": {
+    "appId": "com.reelforge.app",
+    "productName": "ReelForge",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "export-file.js",
+      "package.json"
+    ],
+    "win": {
+      "target": ["nsis"],
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "shortcutName": "ReelForge"
+    }
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  }
+}

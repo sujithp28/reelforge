@@ -1,25 +1,38 @@
-# ReelForge — Local V1
+# ReelForge
 
-Customer-facing AI reel creation app. Describe an idea, get a storyboard, edit
-the scenes, render a real MP4.
+ReelForge turns an idea and your photos into a short reel. You create a project,
+upload images, arrange scenes, add titles and subtitles, choose music, pick a
+publish format, render, preview, and download an MP4.
 
-## What V1 does
+The default local renderer builds the reel from your photos. It does not call a
+paid service unless you set one up yourself.
 
-- Next.js customer UI: landing page, two-step create flow, workspace, project page
-- Creation types, input sources, aspect ratio, and a duration control from 5 to 120s
-- Duration-aware storyboard planner with a per-category beat sheet
-- SQLite persistence for projects, scenes, and uploaded assets
-- Image and audio uploads, per scene or per project
-- Per-scene editing (title, prompt, caption, length) and prompt regeneration
-- FFmpeg render pipeline with live progress, in-browser preview, and MP4 download
-- Optional soundtrack with volume and fade-out, muxed over the finished reel
+## What you can do
+
+1. Create a project.
+2. Upload images (JPEG, PNG, WebP, BMP). Add, replace, remove, and reorder them.
+3. Organize scenes. Each photo stays with its title, subtitle, and length.
+4. Add titles and subtitles, and turn each one on or off.
+5. Add music, or leave the reel silent. Set volume and fade in / fade out.
+6. Choose a publish format: Instagram Reel, YouTube Short, Instagram Feed, or YouTube.
+7. Render. Progress, errors, and retry stay on the project.
+8. Preview the MP4 in the browser.
+9. Download it. A failed render keeps the previous file. Edits mark that file out of date until you render again.
+
+Photos are stored as uploaded. The app does not recompress them.
+
+## Luxury Interiors
+
+The Luxury Interiors template builds a five-scene vertical reel (1080×1920, 30 fps) from a topic in English or Telugu. The default brand name is Luxury Living Studio. You can edit the hook, scene captions, closing line, Instagram caption, YouTube Shorts description, and hashtags. The copy does not invent materials, prices, or a finished project.
+
+Each scene has an image prompt you copy into your own image tool. Copy each prompt, generate its image, download it, and upload it into the matching scene. The recommended still is a portrait 9:16 frame, preferably 1080×1920 or higher. ReelForge does not generate those pictures and does not call a paid image service. JPEG, PNG, WebP, and BMP uploads are assigned to the scene you choose, and photos already in the project can be reused. Rendering waits until every scene has an image. A logo is kept with the project and is not drawn over the picture. Music stays off until you add a track. Rendering and saving to Downloads use the same path as every other reel.
 
 ## Requirements
 
 - Node 20+ and Python 3.11+
-- FFmpeg and ffprobe on PATH
-- A TTF font for captions. Windows and most Linux desktops already have one;
-  otherwise set `REELFORGE_FONT` to a `.ttf` path.
+- FFmpeg and ffprobe on PATH. ReelForge does not download or bundle FFmpeg.
+- A TTF font for on-screen text. Windows already has Georgia and Segoe UI.
+  Otherwise set `REELFORGE_FONT` to a `.ttf` path.
 
 ## Run the backend
 
@@ -31,16 +44,24 @@ python -m pip install -r requirements.txt
 python -m uvicorn app.main:app --reload --port 8000
 ```
 
-`--reload` is for local development. A production process omits it:
+`--reload` is for local development. A local process omits it and stays on this computer:
 
 ```powershell
-python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
+
+Do not publish port 8000. ReelForge has no login, so a public address would expose every project.
 
 Health check: http://localhost:8000/health — it reports whether FFmpeg was found.
 
 State lives in `backend/data/` (SQLite database, uploads, renders). It is
 gitignored; delete the folder to reset.
+
+One command from the repository root starts the API and the site together:
+
+```powershell
+powershell -File scripts/start-reelforge.ps1
+```
 
 ## Run the frontend
 
@@ -93,10 +114,17 @@ python check_schema_order.py
 | POST | `/api/projects` | Create a project and plan its scenes |
 | GET | `/api/projects/{id}` | Project with scenes and assets |
 | DELETE | `/api/projects/{id}` | Delete a project and its files |
+| PATCH | `/api/projects/{id}` | Rename a project. Does not discard the finished reel |
+| PUT | `/api/projects/{id}/scenes/order` | Reorder scenes. Text stays with each scene |
+| POST | `/api/projects/{id}/scenes` | Add a scene |
+| DELETE | `/api/projects/{id}/scenes/{sceneId}` | Remove a scene. The photo file stays if you only remove the scene |
+| DELETE | `/api/projects/{id}/scenes/{sceneId}/asset` | Remove that scene's photo. The file is deleted only when no other scene uses it |
+| DELETE | `/api/projects/{id}/assets/{assetId}` | Delete an uploaded file |
 | PATCH | `/api/projects/{id}/scenes/{sceneId}` | Edit one scene |
 | POST | `/api/projects/{id}/scenes/{sceneId}/regenerate` | New prompt for one scene |
-| POST | `/api/projects/{id}/uploads` | Upload an image or audio file |
-| PATCH | `/api/projects/{id}/audio` | Soundtrack volume and fade |
+| POST | `/api/projects/{id}/uploads` | Upload an image or audio file. `append=true` adds the photo as a new scene |
+| PATCH | `/api/projects/{id}/audio` | Music on or off, volume, fade in, and fade out |
+| PATCH | `/api/projects/{id}/export` | Publish format |
 | PATCH | `/api/projects/{id}/quality` | Standard or high |
 | POST | `/api/projects/{id}/scenes/{sceneId}/retry` | Regenerate one scene, reuse the rest |
 | POST | `/api/projects/{id}/jobs/{jobId}/cancel` | Ask a render to stop |
@@ -108,9 +136,10 @@ python check_schema_order.py
 | POST | `/api/worker/kaggle/jobs/{id}/fail` | Worker: report a failure |
 | GET | `/api/projects/{id}/jobs/{jobId}` | Render job state |
 
-Editing a scene or adding an asset resets the project to `draft` and clears the
-rendered video, so the preview never shows a reel that no longer matches the
-storyboard.
+Editing a scene, photo, or music setting marks the finished reel out of date and
+returns the project to `draft`. The previous MP4 stays until a successful render
+replaces it. A failed render does not remove that file. Renaming a project does
+not mark the reel out of date.
 
 ## Architecture
 
@@ -155,6 +184,12 @@ Defaults are chosen so the app runs locally with no configuration at all.
 | `REELFORGE_LTX_ENDPOINT` | unset | Enables the LTX provider |
 | `REELFORGE_FONT` | autodetected | Caption font path |
 | `REELFORGE_CORS_ORIGINS` | localhost:3000 | Comma-separated origins |
+| `REELFORGE_MAX_UPLOAD_BYTES` | 25 MB | Largest photo or music file |
+| `REELFORGE_WEB_URL` | `http://127.0.0.1:3000` | Page the Windows shell opens |
+| `REELFORGE_PYTHON` | `python` | Python used by the Windows shell |
+| `REELFORGE_PORT` | `8000` | API port for the Windows shell |
+| `REELFORGE_ROOT` | repository root | Where the shell finds `backend/` |
+| `NEXT_PUBLIC_API_URL` | `http://localhost:8000` | Where the website sends API requests |
 
 `/health` reports which of these are active and which providers can run.
 
@@ -374,8 +409,9 @@ step count. The UI does not claim otherwise. Set
   cannot both start a pipeline writing the same output file.
 - `duration` is always the sum of the scene durations. Editing a scene resyncs
   it and validates the resulting total against the 5 to 120 second range.
-- Any storyboard, asset, or audio change clears the rendered video, so the
-  preview can never show a reel that no longer matches the storyboard.
+- Any storyboard, photo, or music change marks the finished reel out of date.
+  The file remains so a failed render cannot destroy the last good MP4.
+  Reordering clears cached clips only for scenes that changed place.
 - A scene edit or regeneration clears only that scene's cached clip. A quality
   change clears all of them, because it changes every scene's pixels.
 - If one scene fails, the others still generate and are kept. The reel fails
@@ -387,18 +423,61 @@ step count. The UI does not claim otherwise. Set
 - Scene jobs survive a restart: anything left claimed by a dead worker is
   requeued on boot, and fails cleanly once its attempts are used up.
 
-## Not in V1
+## Windows desktop
 
-- **Verified** real AI generation. The LTX provider is fully implemented and
-  its request handling is tested against a fake transport, but no LTX
-  credentials were available in this environment, so real generation has never
-  been run. See `test_ltx_integration.py`.
-- Guaranteed visual consistency between scenes or chunks; neither provider
-  exposes a seed or reference parameter for it.
-- A verified Kaggle GPU generation. The queue, worker API, upload,
-  normalisation and retry flow are all tested with a fake worker, but the
-  GPU code path has never run against real model weights.
-- Voice-over and text-to-speech.
-- Auto-generated captions from a script; captions are per-scene and manual.
-- Accounts and multi-user separation; the workspace is whoever has the URL.
-- A real broker, and the S3 storage backend. Both are boundaries today.
+The website does not need the desktop shell. `desktop/` is an Electron shell
+that starts the local API and opens the site.
+
+```powershell
+cd desktop
+npm install
+npm start
+```
+
+`npm start` expects the site on `http://127.0.0.1:3000` unless `REELFORGE_WEB_URL`
+is set. The API listens on `127.0.0.1`. Its files go in Electron's per-user
+data folder, not a path from this repository.
+
+Python and FFmpeg must already be installed and on PATH. They are not bundled.
+The shell finds FFmpeg the same way the API does: by looking on PATH when a
+render starts. There is no application icon in the repository.
+
+After a render finishes in the Windows app, ReelForge copies the finished MP4
+into the current user's Downloads folder. The folder comes from the operating
+system, not from a fixed path. The file is named from the project and the date,
+for example `ReelForge-Luxury-Interior-20261001.mp4`. If that name is already
+there, ReelForge adds `-1`, `-2`, and so on. A failed render does not remove an
+older file. If the copy into Downloads fails, the reel stays available in the
+app and can be saved again. The website does not write to Downloads; it keeps
+the Download MP4 button, and the browser asks where to put the file.
+
+Check the copy logic without Electron:
+
+```powershell
+node desktop/test-export-file.js
+```
+
+An installer configuration is in `desktop/package.json` (`npm run dist` runs
+electron-builder's NSIS target). That installer has not been built or launched
+in this environment. There is no code-signing certificate.
+`signAndEditExecutable` is off so a missing certificate is not treated as a
+signature. Building the installer needs `npm install` inside `desktop/` first.
+
+## Troubleshooting
+
+- The site says it cannot reach the API: start the backend on port 8000, or set `NEXT_PUBLIC_API_URL` in `frontend/.env.local`.
+- Export says it is not available on this computer: install FFmpeg and ffprobe and reopen a new terminal so PATH includes them.
+- A reel stays on "Rendering" after the API was killed: the next startup marks that job failed. The previous finished file, if there was one, is still listed.
+- Upload says the file is too large: the limit is 25 MB unless `REELFORGE_MAX_UPLOAD_BYTES` is set.
+- Photos must be JPEG, PNG, WebP, or BMP. Music must be a playable MP3, M4A, AAC, WAV, or OGG file.
+- The reel length has to stay between 5 and 120 seconds. One scene is 1 to 30 seconds.
+- An unreadable photo can leave a render on "Rendering" until the encoder exits. When that render fails, the last finished MP4 stays available.
+
+## Current limitations
+
+- There is no login. Anyone who can reach the API can open every project. The desktop shell binds the API to `127.0.0.1`. Do not publish port 8000 to the internet until access control exists.
+- The Windows installer configuration has not been built or launched here. There is no app icon and no code-signing certificate. FFmpeg and Python are not inside the installer. Automatic saving into Downloads happens in the Windows app only. The website uses the browser's own download.
+- Scene preview shows the photo with its title. It does not render a separate clip for that scene.
+- The default renderer builds motion from still photos. Paid or GPU generation is optional, off unless configured, and real generation has not been verified in this environment.
+- Voice-over is not included. Titles and subtitles are typed, not generated from speech.
+- S3 storage and a separate job queue are boundaries only. Local disk and the in-process job runner are what runs today.

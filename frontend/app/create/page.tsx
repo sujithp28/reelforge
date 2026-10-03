@@ -5,41 +5,36 @@ import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { ArrowLeft, ArrowRight, ImagePlus, Loader2, Sparkles, Upload, X } from "lucide-react";
 import {
-  api, CATEGORIES, DURATIONS, INPUT_TYPES, QUALITIES, RATIOS,
-  type Project, type Quality, type Ratio,
+  api, CATEGORIES, DURATIONS, EXPORT_FORMATS, INPUT_TYPES, LUXURY_BRAND, LUXURY_CATEGORY, MOCK_QUALITY_NOTE, QUALITIES,
+  exportFormatLabel, type ExportFormat, type Project, type Quality,
 } from "../../lib/api";
 
 const MAX_REFERENCE_IMAGES = 8;
 
-/** One photo fills every scene. Several photos go in scene order, and the last photo covers any scenes left over. */
-async function attachReferences(projectId: string, scenes: Project["scenes"], chosen: File[]) {
-  if (chosen.length === 1) {
-    const saved = await api.upload(projectId, chosen[0]);
-    if (saved.scenes.some(scene => !scene.asset_url)) {
-      throw new Error("The photo uploaded, but it was not attached to every scene.");
+/** Each photo becomes one scene. The last upload finishes the batch and starts the reel. */
+async function attachReferences(
+  projectId: string,
+  scenes: Project["scenes"],
+  chosen: File[],
+  luxury: boolean,
+) {
+  let current: Project | null = null;
+  for (let i = 0; i < chosen.length; i++) {
+    current = await api.upload(projectId, chosen[i], undefined, {
+      replan: i === chosen.length - 1,
+    });
+  }
+  if (!current) throw new Error("No photos were attached.");
+  const timeline = [...current.scenes].sort((a, b) => a.position - b.position);
+  if (luxury) {
+    if (timeline.length !== scenes.length) {
+      throw new Error("The photos uploaded, but the five scenes were not kept.");
     }
     return;
   }
-
-  const ordered = [...scenes].sort((a, b) => a.position - b.position);
-  const count = Math.min(chosen.length, ordered.length);
-  let current: Project | null = null;
-  for (let i = 0; i < count; i++) {
-    current = await api.upload(projectId, chosen[i], ordered[i].id);
-  }
-  if (!current) throw new Error("No photos were attached.");
-  const last = current.scenes.find(scene => scene.id === ordered[count - 1].id);
-  if (!last?.asset_id) throw new Error("The last photo was not attached to its scene.");
-  for (let i = count; i < ordered.length; i++) {
-    current = await api.assignSceneAsset(projectId, ordered[i].id, last.asset_id);
-  }
-  // Photos beyond the scene count stay on the project so a scene can switch to them.
-  // Every scene already has an image, so these uploads do not fill bare scenes.
-  for (let i = count; i < chosen.length; i++) {
-    current = await api.upload(projectId, chosen[i]);
-  }
-  if (current.scenes.some(scene => !scene.asset_url)) {
-    throw new Error("A scene was left without a photo.");
+  const expected = Math.min(chosen.length, MAX_REFERENCE_IMAGES);
+  if (timeline.length !== expected || timeline.some(scene => !scene.asset_url)) {
+    throw new Error("The photos uploaded, but the reel timeline did not match them.");
   }
 }
 
@@ -56,9 +51,11 @@ function CreateForm() {
   );
   const [idea, setIdea] = useState("");
   const [input, setInput] = useState<string>("Idea");
-  const [ratio, setRatio] = useState<Ratio>("9:16");
+  const [format, setFormat] = useState<ExportFormat>("instagram_reel");
   const [duration, setDuration] = useState(30);
   const [quality, setQuality] = useState<Quality>("standard");
+  const [language, setLanguage] = useState<"en" | "te">("en");
+  const [brand, setBrand] = useState(LUXURY_BRAND);
   const [files, setFiles] = useState<File[]>([]);
   const [previews, setPreviews] = useState<string[]>([]);
   // The storyboard request is JSON and cannot carry the photos. generate()
@@ -73,8 +70,20 @@ function CreateForm() {
   // Set once create succeeds, so a failed reference upload can be retried
   // against the same project instead of silently building a title-card reel.
   const [createdId, setCreatedId] = useState<string | null>(null);
+  const [videoProvider, setVideoProvider] = useState<string | null>(null);
+  const mockPreview = videoProvider === "mock";
 
   const ready = useMemo(() => idea.trim().length > 0, [idea]);
+  const luxury = type === LUXURY_CATEGORY;
+
+  function chooseType(next: string) {
+    setType(next);
+    if (next === LUXURY_CATEGORY) {
+      setDuration(30);
+      setFormat("instagram_reel");
+      setInput("Image");
+    }
+  }
 
   function setChosen(next: File[]) {
     const capped = next.slice(0, MAX_REFERENCE_IMAGES);
@@ -106,6 +115,20 @@ function CreateForm() {
     };
   }, [files]);
 
+  useEffect(() => {
+    let cancelled = false;
+    api.health()
+      .then(body => {
+        if (!cancelled) setVideoProvider(body.video_provider);
+      })
+      .catch(() => {
+        if (!cancelled) setVideoProvider(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // These sources mean the reel is the customer's picture. Idea can still
   // be title cards. Image cannot.
   const needsPhoto = input === "Image" || input === "Image + text" || input === "Product" || input === "Person";
@@ -128,8 +151,10 @@ function CreateForm() {
           category: type,
           input_type: input,
           duration,
-          aspect_ratio: ratio,
+          aspect_ratio: format === "instagram_feed" ? "4:5" : format === "youtube_landscape" ? "16:9" : "9:16",
+          export_preset: format,
           quality,
+          ...(luxury ? { brand_name: brand.trim() || LUXURY_BRAND, language } : {}),
         });
         projectId = project.id;
         scenes = project.scenes;
@@ -140,7 +165,8 @@ function CreateForm() {
       // The create body is JSON, so the photos are the next requests. Every
       // scene has to point at an image before we leave this page.
       if (chosen.length > 0) {
-        await attachReferences(projectId, scenes, chosen);
+        if (!scenes) throw new Error("The storyboard was not created.");
+        await attachReferences(projectId, scenes, chosen, type === LUXURY_CATEGORY);
       }
       router.push(`/projects/${projectId}`);
     } catch (e) {
@@ -157,10 +183,16 @@ function CreateForm() {
           <div className="mb-8">
             <p className="text-sm text-violet-400">Step 2 of 2</p>
             <h1 className="mt-2 text-3xl font-semibold">Your reel settings</h1>
-            {files.length === 1 ? (
+            {luxury ? (
+              <p className="mt-3 text-sm text-zinc-300">
+                {files.length
+                  ? `${files.length} photo${files.length === 1 ? "" : "s"} will fill the five scenes. Extra photos stay in the project library.`
+                  : "No photos yet. You can add them on the project after the five scenes are created."}
+              </p>
+            ) : files.length === 1 ? (
               <p className="mt-3 text-sm text-zinc-300">Reference photo: {files[0].name}. It will be used for every scene.</p>
             ) : files.length > 1 ? (
-              <p className="mt-3 text-sm text-zinc-300">{files.length} reference photos. Each scene gets the next photo, and extra scenes reuse the last one.</p>
+              <p className="mt-3 text-sm text-zinc-300">{files.length} reference photos. Each uploaded image becomes its own scene.</p>
             ) : (
               <p className="mt-3 text-sm text-amber-200/90">No reference photo is selected, so the reel will be title cards. Go back to add one.</p>
             )}
@@ -188,44 +220,55 @@ function CreateForm() {
               <div className="mt-2 text-2xl font-semibold">{duration}s</div>
             </section>
             <section className="rounded-2xl border border-zinc-800 bg-zinc-900 p-6">
-              <h2 className="font-semibold">Aspect ratio</h2>
-              <div className="mt-4 grid grid-cols-4 gap-2">
-                {RATIOS.map(r => <button key={r} onClick={() => setRatio(r)} className={`rounded-xl border p-3 text-sm ${ratio === r ? "border-violet-500 bg-violet-500/10 text-white" : "border-zinc-800 text-zinc-400 hover:border-zinc-700"}`}>{r}</button>)}
+              <h2 className="font-semibold">Publish format</h2>
+              <p className="mt-1 text-sm text-zinc-500">Where this reel will be posted.</p>
+              <div className="mt-4 grid gap-2">
+                {(luxury ? EXPORT_FORMATS.filter(item => item.ratio === "9:16" && (item.id === "instagram_reel" || item.id === "youtube_short")) : EXPORT_FORMATS).map(item => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => setFormat(item.id)}
+                    className={`rounded-xl border p-3 text-left text-sm ${format === item.id ? "border-violet-500 bg-violet-500/10 text-white" : "border-zinc-800 text-zinc-400 hover:border-zinc-700"}`}
+                  >
+                    {item.label}
+                  </button>
+                ))}
               </div>
-              <p className="mt-4 text-sm text-zinc-500">
-                {ratio === "9:16" && "Vertical — Reels, Shorts, TikTok. 1080×1920."}
-                {ratio === "16:9" && "Landscape — YouTube, web embeds. 1920×1080."}
-                {ratio === "1:1" && "Square — feed posts. 1080×1080."}
-                {ratio === "4:5" && "Portrait — Instagram feed. 1080×1350."}
-              </p>
+              <p className="mt-4 text-sm font-medium text-white">{exportFormatLabel(format)}</p>
             </section>
           </div>
 
           <section className="mt-6 rounded-2xl border border-zinc-800 bg-zinc-900 p-6">
             <h2 className="font-semibold">Quality</h2>
-            <p className="mt-1 text-sm text-zinc-500">Applies when scenes are generated.</p>
-            <div className="mt-4 grid gap-2 sm:grid-cols-2">
-              {QUALITIES.map(q => (
-                <button
-                  key={q.value}
-                  onClick={() => setQuality(q.value)}
-                  className={`rounded-xl border p-4 text-left ${quality === q.value ? "border-violet-500 bg-violet-500/10 text-white" : "border-zinc-800 text-zinc-400 hover:border-zinc-700"}`}
-                >
-                  <div className="font-medium">{q.label}</div>
-                  <div className="mt-1 text-xs text-zinc-500">{q.hint}</div>
-                </button>
-              ))}
-            </div>
+            {mockPreview ? (
+              <p className="mt-1 text-sm text-zinc-400">{MOCK_QUALITY_NOTE}</p>
+            ) : (
+              <>
+                <p className="mt-1 text-sm text-zinc-500">Applies when scenes are generated.</p>
+                <div className="mt-4 grid gap-2 sm:grid-cols-2">
+                  {QUALITIES.map(q => (
+                    <button
+                      key={q.value}
+                      onClick={() => setQuality(q.value)}
+                      className={`rounded-xl border p-4 text-left ${quality === q.value ? "border-violet-500 bg-violet-500/10 text-white" : "border-zinc-800 text-zinc-400 hover:border-zinc-700"}`}
+                    >
+                      <div className="font-medium">{q.label}</div>
+                      <div className="mt-1 text-xs text-zinc-500">{q.hint}</div>
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
           </section>
 
           {error && (
             <p className="mt-6 rounded-xl border border-red-900 bg-red-950/50 p-4 text-sm text-red-300">{error}</p>
           )}
 
-          <button onClick={() => generate(false)} disabled={busy || files.length === 0} className="mt-8 inline-flex items-center gap-2 rounded-xl bg-violet-500 px-6 py-3.5 font-semibold hover:bg-violet-400 disabled:cursor-not-allowed disabled:opacity-50">
+          <button onClick={() => generate(luxury)} disabled={busy || (!luxury && files.length === 0)} className="mt-8 inline-flex items-center gap-2 rounded-xl bg-violet-500 px-6 py-3.5 font-semibold hover:bg-violet-400 disabled:cursor-not-allowed disabled:opacity-50">
             {busy ? <><Loader2 size={18} className="animate-spin"/> Building storyboard</> : <>Generate storyboard <Sparkles size={18}/></>}
           </button>
-          {files.length === 0 && (
+          {files.length === 0 && !luxury && (
             <button type="button" onClick={() => generate(true)} disabled={busy} className="mt-3 block text-sm text-zinc-500 underline-offset-2 hover:text-zinc-300 hover:underline">
               Generate title cards without a photo
             </button>
@@ -247,11 +290,26 @@ function CreateForm() {
         <div className="grid gap-8 lg:grid-cols-[1fr_380px]">
           <section>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-              {CATEGORIES.map(t => <button key={t} onClick={() => setType(t)} className={`rounded-2xl border p-4 text-left ${type === t ? "border-violet-500 bg-violet-500/10" : "border-zinc-800 bg-zinc-900 hover:border-zinc-700"}`}>{t}</button>)}
+              {CATEGORIES.map(t => <button key={t} onClick={() => chooseType(t)} className={`rounded-2xl border p-4 text-left ${type === t ? "border-violet-500 bg-violet-500/10" : "border-zinc-800 bg-zinc-900 hover:border-zinc-700"}`}>{t}</button>)}
             </div>
             <div className="mt-6 rounded-2xl border border-zinc-800 bg-zinc-900 p-5">
               <label className="text-sm font-medium" htmlFor="idea">Your idea</label>
               <textarea id="idea" value={idea} onChange={e => setIdea(e.target.value)} placeholder="Example: Create a 30-second luxury real-estate reel for this house..." className="mt-3 min-h-36 w-full resize-none rounded-xl border border-zinc-800 bg-zinc-950 p-4 text-sm outline-none placeholder:text-zinc-600 focus:border-violet-500" />
+              {luxury && (
+                <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                  <label className="text-sm">
+                    Language
+                    <span className="mt-2 flex gap-2">
+                      <button type="button" onClick={() => setLanguage("en")} className={`rounded-lg px-3 py-2 text-xs ${language === "en" ? "bg-white text-zinc-950" : "bg-zinc-800 text-zinc-400"}`}>English</button>
+                      <button type="button" onClick={() => setLanguage("te")} className={`rounded-lg px-3 py-2 text-xs ${language === "te" ? "bg-white text-zinc-950" : "bg-zinc-800 text-zinc-400"}`}>Telugu</button>
+                    </span>
+                  </label>
+                  <label className="text-sm" htmlFor="brand">
+                    Brand name
+                    <input id="brand" value={brand} maxLength={80} onChange={e => setBrand(e.target.value)} className="mt-2 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm outline-none focus:border-violet-500" />
+                  </label>
+                </div>
+              )}
               <div className="mt-4 flex flex-wrap gap-2">
                 {INPUT_TYPES.map(x => <button key={x} onClick={() => setInput(x)} className={`rounded-lg px-3 py-2 text-xs ${input === x ? "bg-white text-zinc-950" : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700"}`}>{x}</button>)}
               </div>
@@ -300,9 +358,11 @@ function CreateForm() {
                     ))}
                   </ul>
                   <p className="mt-2 text-xs text-zinc-500">
-                    {files.length === 1
-                      ? `${files[0].name} is used on every scene.`
-                      : `${files.length} photos. Scenes take them in order. Extra scenes reuse the last photo.`}
+                    {luxury
+                      ? `${files.length} photo${files.length === 1 ? "" : "s"} for the five-scene reel. Extra photos stay in the library.`
+                      : files.length === 1
+                        ? `${files[0].name} is used on every scene.`
+                        : `${files.length} photos. Each uploaded image becomes its own scene.`}
                   </p>
                 </div>
               )}
@@ -314,14 +374,15 @@ function CreateForm() {
               <div className="flex justify-between"><span className="text-zinc-500">Type</span><span>{type}</span></div>
               <div className="flex justify-between"><span className="text-zinc-500">Source</span><span>{input}</span></div>
               <div className="flex justify-between"><span className="text-zinc-500">Duration</span><span>{duration} sec</span></div>
-              <div className="flex justify-between"><span className="text-zinc-500">Format</span><span>{ratio}</span></div>
-              <div className="flex justify-between"><span className="text-zinc-500">Quality</span><span className="capitalize">{quality}</span></div>
+              <div className="flex justify-between"><span className="text-zinc-500">Format</span><span>{exportFormatLabel(format)}</span></div>
+              <div className="flex justify-between"><span className="text-zinc-500">Quality</span><span className="capitalize">{mockPreview ? "FFmpeg preview" : quality}</span></div>
             </div>
-            <button disabled={!ready || (needsPhoto && files.length === 0)} onClick={() => setStep(2)} className="mt-7 flex w-full items-center justify-center gap-2 rounded-xl bg-violet-500 px-5 py-3.5 font-semibold hover:bg-violet-400 disabled:cursor-not-allowed disabled:opacity-40">
+            <button disabled={!ready || (!luxury && needsPhoto && files.length === 0)} onClick={() => setStep(2)} className="mt-7 flex w-full items-center justify-center gap-2 rounded-xl bg-violet-500 px-5 py-3.5 font-semibold hover:bg-violet-400 disabled:cursor-not-allowed disabled:opacity-40">
               Continue <ArrowRight size={18}/>
             </button>
             {!ready && <p className="mt-3 text-center text-xs text-zinc-600">Describe your idea to continue.</p>}
-            {ready && needsPhoto && files.length === 0 && <p className="mt-3 text-center text-xs text-amber-200/90">Add one or more reference photos. One photo is used on every scene.</p>}
+            {ready && luxury && files.length === 0 && <p className="mt-3 text-center text-xs text-zinc-500">You can add photos now, or choose images already in the project after the scenes are created.</p>}
+            {ready && !luxury && needsPhoto && files.length === 0 && <p className="mt-3 text-center text-xs text-amber-200/90">Add one or more reference photos. One photo is used on every scene.</p>}
           </aside>
         </div>
       </div>
